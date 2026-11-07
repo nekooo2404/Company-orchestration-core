@@ -1,4 +1,16 @@
-import type { DomainEvent, EventId, Task, TaskId, WorkflowId } from '@aicompany/contracts';
+import {
+  DomainEventSchema,
+  EventIdSchema,
+  OutboxCommandSchema,
+  TaskIdSchema,
+  TaskSchema,
+  WorkflowIdSchema,
+  type DomainEvent,
+  type EventId,
+  type Task,
+  type TaskId,
+  type WorkflowId
+} from '@aicompany/contracts';
 import {
   DuplicatePersistenceIdError,
   InvalidPersistenceOperationError,
@@ -44,11 +56,13 @@ export class InMemoryEventStore implements EventStore {
       return;
     }
 
-    const aggregateId = events[0].aggregateId;
+    const parsedEvents = events.map((event) => DomainEventSchema.parse(event));
+
+    const aggregateId = parsedEvents[0].aggregateId;
     const seenIds = new Set<string>();
     let existingCount = 0;
 
-    for (const event of events) {
+    for (const event of parsedEvents) {
       if (event.aggregateId !== aggregateId) {
         throw new InvalidPersistenceOperationError('An event append must target one aggregate');
       }
@@ -66,7 +80,7 @@ export class InMemoryEventStore implements EventStore {
       }
     }
 
-    if (existingCount === events.length) {
+    if (existingCount === parsedEvents.length) {
       return;
     }
     if (existingCount > 0) {
@@ -79,7 +93,7 @@ export class InMemoryEventStore implements EventStore {
       throw new OptimisticConcurrencyError(aggregateId, expectedVersion, actualVersion);
     }
 
-    events.forEach((event, index) => {
+    parsedEvents.forEach((event, index) => {
       const expectedEventVersion = expectedVersion + index + 1;
       if (event.aggregateVersion !== expectedEventVersion) {
         throw new InvalidPersistenceOperationError(
@@ -88,7 +102,7 @@ export class InMemoryEventStore implements EventStore {
       }
     });
 
-    const storedEvents = events.map(clone);
+    const storedEvents = parsedEvents.map(clone);
     stream.push(...storedEvents);
     this.streams.set(aggregateId, stream);
     for (const event of storedEvents) {
@@ -104,7 +118,7 @@ export class InMemoryEventStore implements EventStore {
   }
 
   public async hasEvent(eventId: EventId): Promise<boolean> {
-    return this.eventsById.has(eventId);
+    return this.eventsById.has(EventIdSchema.parse(eventId));
   }
 }
 
@@ -112,37 +126,39 @@ export class InMemoryTaskRepository implements TaskRepository {
   private readonly tasks = new Map<string, Task>();
 
   public async get(taskId: TaskId): Promise<Task | null> {
-    const task = this.tasks.get(taskId);
+    const task = this.tasks.get(TaskIdSchema.parse(taskId));
     return task === undefined ? null : clone(task);
   }
 
   public async listByWorkflow(workflowId: WorkflowId): Promise<Task[]> {
+    const parsedWorkflowId = WorkflowIdSchema.parse(workflowId);
     return [...this.tasks.values()]
-      .filter((task) => task.workflowId === workflowId)
+      .filter((task) => task.workflowId === parsedWorkflowId)
       .sort((left, right) => left.id.localeCompare(right.id))
       .map(clone);
   }
 
   public async save(task: Task, expectedVersion: number): Promise<void> {
     assertVersion(expectedVersion, 'expectedVersion');
-    const existing = this.tasks.get(task.id);
+    const parsedTask = TaskSchema.parse(task);
+    const existing = this.tasks.get(parsedTask.id);
     if (existing === undefined) {
-      if (expectedVersion !== 0 || task.version !== 0) {
-        throw new OptimisticConcurrencyError(task.id, expectedVersion, 0);
+      if (expectedVersion !== 0 || parsedTask.version !== 0) {
+        throw new OptimisticConcurrencyError(parsedTask.id, expectedVersion, 0);
       }
-      this.tasks.set(task.id, clone(task));
+      this.tasks.set(parsedTask.id, clone(parsedTask));
       return;
     }
 
     if (existing.version !== expectedVersion) {
       throw new OptimisticConcurrencyError(task.id, expectedVersion, existing.version);
     }
-    if (task.version !== expectedVersion + 1) {
+    if (parsedTask.version !== expectedVersion + 1) {
       throw new InvalidPersistenceOperationError(
-        `Task ${task.id} must have version ${expectedVersion + 1}`
+        `Task ${parsedTask.id} must have version ${expectedVersion + 1}`
       );
     }
-    this.tasks.set(task.id, clone(task));
+    this.tasks.set(parsedTask.id, clone(parsedTask));
   }
 }
 
@@ -165,14 +181,15 @@ export class InMemoryOutbox implements Outbox {
   }
 
   public async enqueue(command: OutboxCommand): Promise<void> {
-    const existing = this.commands.get(command.commandId);
+    const parsedCommand = OutboxCommandSchema.parse(command);
+    const existing = this.commands.get(parsedCommand.commandId);
     if (existing !== undefined) {
-      if (!sameValue(existing, command)) {
-        throw new DuplicatePersistenceIdError('outbox command', command.commandId);
+      if (!sameValue(existing, parsedCommand)) {
+        throw new DuplicatePersistenceIdError('outbox command', parsedCommand.commandId);
       }
       return;
     }
-    this.commands.set(command.commandId, clone(command));
+    this.commands.set(parsedCommand.commandId, clone(parsedCommand));
   }
 
   public async claim(limit: number, workerId: string): Promise<OutboxCommand[]> {

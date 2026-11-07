@@ -134,4 +134,20 @@ describe('in-memory persistence adapters', () => {
     const recoveredClaim = await outbox.claim(1, 'worker-b');
     expect(recoveredClaim.map((command) => command.commandId)).toEqual(['command-2']);
   });
+
+  it('parses canonical contracts at persistence boundaries', async () => {
+    const store = new InMemoryEventStore();
+    const repository = new InMemoryTaskRepository();
+    const outbox = new InMemoryOutbox();
+
+    await expect(
+      store.append([{ ...makeEvent(1), payload: {} } as unknown as DomainEvent], 0)
+    ).rejects.toThrow();
+    await expect(
+      repository.save({ ...makeTask(), state: 'UNKNOWN' } as unknown as Task, 0)
+    ).rejects.toThrow();
+    await expect(
+      outbox.enqueue({ ...makeCommand(), payload: {} } as unknown as OutboxCommand)
+    ).rejects.toThrow();
+  });
 });
