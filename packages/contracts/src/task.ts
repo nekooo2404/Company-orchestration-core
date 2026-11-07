@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import {
   AgentDefinitionIdSchema,
+  CorrelationIdSchema,
   TaskIdSchema,
   WorkflowIdSchema
 } from './ids';
@@ -45,14 +46,14 @@ export const TaskSchema = z.object({
   outputContract: OutputContractSchema,
   budget: TaskBudgetSchema,
   recoveryCycles: z.number().int().min(0).max(5),
+  projectId: nonEmptyText,
+  parentTaskId: TaskIdSchema.nullable(),
+  ownerAgentDefinitionId: AgentDefinitionIdSchema.nullable(),
+  deadline: z.date().nullable(),
+  traceId: CorrelationIdSchema,
   version: z.number().int().nonnegative(),
   createdAt: z.date(),
   updatedAt: z.date(),
-  projectId: nonEmptyText.optional(),
-  parentTaskId: TaskIdSchema.nullable().optional(),
-  ownerAgentDefinitionId: AgentDefinitionIdSchema.nullable().optional(),
-  deadline: z.date().nullable().optional(),
-  traceId: nonEmptyText.optional(),
   priority: z.number().int().optional(),
   title: nonEmptyText.optional(),
   description: z.string().optional(),

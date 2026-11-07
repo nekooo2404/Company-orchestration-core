@@ -13,7 +13,7 @@
   },
   "scripts": {
     "build": "tsc -b",
-    "test": "vitest run --root ../.. --config vitest.config.ts",
+    "test": "vitest run --config vitest.config.ts",
     "typecheck": "tsc -b"
   },
   "dependencies": {

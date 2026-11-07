@@ -1,10 +1,19 @@
 import { z } from 'zod';
 import {
+  ApprovalIdSchema,
+  AgentDefinitionIdSchema,
+  AgentSessionIdSchema,
   CorrelationIdSchema,
   EventIdSchema,
+  TaskIdSchema,
+  WorkflowIdSchema,
   type EventId
 } from './ids';
 import { ActorRefSchema, type ActorRef } from './agent';
+import { ApprovalSubjectTypeSchema } from './approval';
+
+const nonEmptyText = z.string().refine((value) => value.trim().length > 0);
+const nonEmptyTextArray = z.array(nonEmptyText).min(1);
 
 export const EventTypeSchema = z.enum([
   'TASK_CREATED',
@@ -12,10 +21,8 @@ export const EventTypeSchema = z.enum([
   'TASK_STARTED',
   'TASK_PROGRESS',
   'REVIEW_REQUESTED',
-  'TASK_REVIEW_REQUESTED',
   'ARTIFACT_CREATED',
   'BLOCKED',
-  'TASK_BLOCKED',
   'TASK_FAILED',
   'RECOVERY_STARTED',
   'TASK_COMPLETED',
@@ -35,21 +42,204 @@ export const EventTypeSchema = z.enum([
 ]);
 export type EventType = z.infer<typeof EventTypeSchema>;
 
-export const EventPayloadSchema = z.record(z.unknown());
+export const TaskCreatedPayloadSchema = z.object({
+  taskId: TaskIdSchema,
+  workflowId: WorkflowIdSchema
+});
+export const TaskReadyPayloadSchema = z.object({ taskId: TaskIdSchema });
+export const TaskStartedPayloadSchema = z.object({
+  sessionId: AgentSessionIdSchema,
+  taskId: TaskIdSchema.optional()
+});
+export const TaskProgressPayloadSchema = z.object({
+  taskId: TaskIdSchema.optional(),
+  progress: nonEmptyText.optional(),
+  message: nonEmptyText.optional(),
+  percent: z.number().min(0).max(100).optional()
+}).refine(({ progress, message, percent }) =>
+  progress !== undefined || message !== undefined || percent !== undefined
+);
+export const ReviewRequestedPayloadSchema = z.object({
+  taskId: TaskIdSchema,
+  evidenceIds: z.array(nonEmptyText).optional()
+});
+export const ArtifactCreatedPayloadSchema = z.union([
+  z.object({ artifactId: nonEmptyText, taskId: TaskIdSchema.optional() }),
+  z.object({ artifactReference: nonEmptyText, taskId: TaskIdSchema.optional() })
+]);
+export const BlockedPayloadSchema = z.object({
+  reason: nonEmptyText,
+  taskId: TaskIdSchema.optional()
+});
+export const TaskFailedPayloadSchema = z.object({
+  failureFingerprint: nonEmptyText,
+  taskId: TaskIdSchema.optional()
+});
+export const RecoveryStartedPayloadSchema = z.object({
+  recoveryId: nonEmptyText,
+  taskId: TaskIdSchema.optional()
+});
+export const TaskCompletedPayloadSchema = z.object({
+  evidenceIds: nonEmptyTextArray,
+  taskId: TaskIdSchema.optional()
+});
+export const DeploymentApprovalRequestedPayloadSchema = z.object({
+  approvalId: ApprovalIdSchema,
+  taskId: TaskIdSchema
+});
+export const ApprovalRequestedPayloadSchema = z.object({
+  approvalId: ApprovalIdSchema,
+  subjectType: ApprovalSubjectTypeSchema,
+  subjectId: nonEmptyText,
+  reason: nonEmptyText
+});
+export const TaskEscalatedPayloadSchema = z.object({
+  reason: nonEmptyText,
+  taskId: TaskIdSchema.optional()
+});
+export const TaskCancelledPayloadSchema = z.object({
+  reason: nonEmptyText,
+  taskId: TaskIdSchema.optional()
+});
+export const AgentSessionCreatedPayloadSchema = z.object({
+  sessionId: AgentSessionIdSchema,
+  taskId: TaskIdSchema,
+  agentDefinitionId: AgentDefinitionIdSchema
+});
+export const AgentSessionStartedPayloadSchema = z.object({
+  sessionId: AgentSessionIdSchema,
+  taskId: TaskIdSchema.optional()
+});
+export const AgentSessionPausedPayloadSchema = z.object({
+  sessionId: AgentSessionIdSchema,
+  reason: nonEmptyText
+});
+export const AgentSessionResumedPayloadSchema = z.object({
+  sessionId: AgentSessionIdSchema
+});
+export const AgentSessionCompletedPayloadSchema = z.object({
+  sessionId: AgentSessionIdSchema
+});
+export const AgentSessionFailedPayloadSchema = z.object({
+  sessionId: AgentSessionIdSchema,
+  failureFingerprint: nonEmptyText
+});
+export const AgentSessionCancelledPayloadSchema = z.object({
+  sessionId: AgentSessionIdSchema,
+  reason: nonEmptyText
+});
+export const ApprovalApprovedPayloadSchema = z.object({
+  approvalId: ApprovalIdSchema,
+  decidedAt: z.date().optional()
+});
+export const ApprovalRejectedPayloadSchema = z.object({
+  approvalId: ApprovalIdSchema,
+  reason: nonEmptyText
+});
+
+export const EventPayloadSchema = z.union([
+  TaskCreatedPayloadSchema,
+  TaskReadyPayloadSchema,
+  TaskStartedPayloadSchema,
+  TaskProgressPayloadSchema,
+  ReviewRequestedPayloadSchema,
+  ArtifactCreatedPayloadSchema,
+  BlockedPayloadSchema,
+  TaskFailedPayloadSchema,
+  RecoveryStartedPayloadSchema,
+  TaskCompletedPayloadSchema,
+  DeploymentApprovalRequestedPayloadSchema,
+  ApprovalRequestedPayloadSchema,
+  TaskEscalatedPayloadSchema,
+  TaskCancelledPayloadSchema,
+  AgentSessionCreatedPayloadSchema,
+  AgentSessionStartedPayloadSchema,
+  AgentSessionPausedPayloadSchema,
+  AgentSessionResumedPayloadSchema,
+  AgentSessionCompletedPayloadSchema,
+  AgentSessionFailedPayloadSchema,
+  AgentSessionCancelledPayloadSchema,
+  ApprovalApprovedPayloadSchema,
+  ApprovalRejectedPayloadSchema
+]);
 export type EventPayload = z.infer<typeof EventPayloadSchema>;
 
-export const DomainEventSchema = z.object({
+const eventAuditFields = {
   eventId: EventIdSchema,
-  aggregateType: z.string().refine((value) => value.trim().length > 0),
-  aggregateId: z.string().refine((value) => value.trim().length > 0),
+  aggregateType: nonEmptyText,
+  aggregateId: nonEmptyText,
   aggregateVersion: z.number().int().positive(),
-  eventType: EventTypeSchema,
   actor: ActorRefSchema,
   correlationId: CorrelationIdSchema,
-  causationId: EventIdSchema.nullable(),
-  occurredAt: z.date(),
-  payload: EventPayloadSchema
-});
+  causationId: EventIdSchema,
+  occurredAt: z.date()
+};
+
+export const DomainEventSchema = z.discriminatedUnion('eventType', [
+  z.object({ ...eventAuditFields, eventType: z.literal('TASK_CREATED'), payload: TaskCreatedPayloadSchema }),
+  z.object({ ...eventAuditFields, eventType: z.literal('TASK_READY'), payload: TaskReadyPayloadSchema }),
+  z.object({ ...eventAuditFields, eventType: z.literal('TASK_STARTED'), payload: TaskStartedPayloadSchema }),
+  z.object({ ...eventAuditFields, eventType: z.literal('TASK_PROGRESS'), payload: TaskProgressPayloadSchema }),
+  z.object({ ...eventAuditFields, eventType: z.literal('REVIEW_REQUESTED'), payload: ReviewRequestedPayloadSchema }),
+  z.object({ ...eventAuditFields, eventType: z.literal('ARTIFACT_CREATED'), payload: ArtifactCreatedPayloadSchema }),
+  z.object({ ...eventAuditFields, eventType: z.literal('BLOCKED'), payload: BlockedPayloadSchema }),
+  z.object({ ...eventAuditFields, eventType: z.literal('TASK_FAILED'), payload: TaskFailedPayloadSchema }),
+  z.object({ ...eventAuditFields, eventType: z.literal('RECOVERY_STARTED'), payload: RecoveryStartedPayloadSchema }),
+  z.object({ ...eventAuditFields, eventType: z.literal('TASK_COMPLETED'), payload: TaskCompletedPayloadSchema }),
+  z.object({
+    ...eventAuditFields,
+    eventType: z.literal('DEPLOYMENT_APPROVAL_REQUESTED'),
+    payload: DeploymentApprovalRequestedPayloadSchema
+  }),
+  z.object({ ...eventAuditFields, eventType: z.literal('APPROVAL_REQUESTED'), payload: ApprovalRequestedPayloadSchema }),
+  z.object({ ...eventAuditFields, eventType: z.literal('TASK_ESCALATED'), payload: TaskEscalatedPayloadSchema }),
+  z.object({ ...eventAuditFields, eventType: z.literal('TASK_CANCELLED'), payload: TaskCancelledPayloadSchema }),
+  z.object({
+    ...eventAuditFields,
+    eventType: z.literal('AGENT_SESSION_CREATED'),
+    payload: AgentSessionCreatedPayloadSchema
+  }),
+  z.object({
+    ...eventAuditFields,
+    eventType: z.literal('AGENT_SESSION_STARTED'),
+    payload: AgentSessionStartedPayloadSchema
+  }),
+  z.object({
+    ...eventAuditFields,
+    eventType: z.literal('AGENT_SESSION_PAUSED'),
+    payload: AgentSessionPausedPayloadSchema
+  }),
+  z.object({
+    ...eventAuditFields,
+    eventType: z.literal('AGENT_SESSION_RESUMED'),
+    payload: AgentSessionResumedPayloadSchema
+  }),
+  z.object({
+    ...eventAuditFields,
+    eventType: z.literal('AGENT_SESSION_COMPLETED'),
+    payload: AgentSessionCompletedPayloadSchema
+  }),
+  z.object({
+    ...eventAuditFields,
+    eventType: z.literal('AGENT_SESSION_FAILED'),
+    payload: AgentSessionFailedPayloadSchema
+  }),
+  z.object({
+    ...eventAuditFields,
+    eventType: z.literal('AGENT_SESSION_CANCELLED'),
+    payload: AgentSessionCancelledPayloadSchema
+  }),
+  z.object({
+    ...eventAuditFields,
+    eventType: z.literal('APPROVAL_APPROVED'),
+    payload: ApprovalApprovedPayloadSchema
+  }),
+  z.object({
+    ...eventAuditFields,
+    eventType: z.literal('APPROVAL_REJECTED'),
+    payload: ApprovalRejectedPayloadSchema
+  })
+]);
 export type DomainEvent = z.infer<typeof DomainEventSchema>;
 
 export const CommandTypeSchema = z.enum([
@@ -60,17 +250,60 @@ export const CommandTypeSchema = z.enum([
 ]);
 export type CommandType = z.infer<typeof CommandTypeSchema>;
 
-export const OutboxCommandSchema = z.object({
-  commandId: z.string().refine((value) => value.trim().length > 0),
-  type: CommandTypeSchema,
-  payload: EventPayloadSchema,
+export const StartAgentSessionPayloadSchema = z.object({
+  taskId: TaskIdSchema,
+  workflowId: WorkflowIdSchema,
+  agentDefinitionId: AgentDefinitionIdSchema,
+  leaseId: nonEmptyText
+});
+export const StartRecoveryPayloadSchema = z.object({
+  taskId: TaskIdSchema,
+  recoveryId: nonEmptyText
+});
+export const RequestApprovalPayloadSchema = z.object({
+  subjectType: ApprovalSubjectTypeSchema,
+  subjectId: nonEmptyText,
+  reason: nonEmptyText
+});
+export const DeployPayloadSchema = z.object({
+  taskId: TaskIdSchema,
+  approvalId: ApprovalIdSchema
+});
+
+const commandAuditFields = {
+  commandId: nonEmptyText,
+  actor: ActorRefSchema,
+  issuedAt: z.date(),
   availableAt: z.date(),
-  correlationId: CorrelationIdSchema.optional(),
-  causationId: EventIdSchema.nullable().optional(),
+  correlationId: CorrelationIdSchema,
+  causationId: EventIdSchema,
   claimedBy: z.string().nullable().optional(),
   claimedAt: z.date().nullable().optional(),
   completedAt: z.date().nullable().optional()
-});
+};
+
+export const OutboxCommandSchema = z.discriminatedUnion('type', [
+  z.object({
+    ...commandAuditFields,
+    type: z.literal('START_AGENT_SESSION'),
+    payload: StartAgentSessionPayloadSchema
+  }),
+  z.object({
+    ...commandAuditFields,
+    type: z.literal('START_RECOVERY'),
+    payload: StartRecoveryPayloadSchema
+  }),
+  z.object({
+    ...commandAuditFields,
+    type: z.literal('REQUEST_APPROVAL'),
+    payload: RequestApprovalPayloadSchema
+  }),
+  z.object({
+    ...commandAuditFields,
+    type: z.literal('DEPLOY'),
+    payload: DeployPayloadSchema
+  })
+]);
 export type OutboxCommand = z.infer<typeof OutboxCommandSchema>;
 
 export type EventActor = ActorRef;

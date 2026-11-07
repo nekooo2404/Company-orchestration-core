@@ -11,16 +11,17 @@ export type ApprovalId = Brand<'ApprovalId'>;
 export type CorrelationId = Brand<'CorrelationId'>;
 
 const createId = <Name extends string>(name: Name, value: string): Brand<Name> => {
-  if (value.trim().length === 0) {
+  const normalized = value.trim();
+  if (normalized.length === 0) {
     throw new Error(`${name} cannot be empty`);
   }
-  return value as Brand<Name>;
+  return normalized as Brand<Name>;
 };
 
 const createIdSchema = <Name extends string>(name: Name) =>
   z.string().refine((value) => value.trim().length > 0, {
     message: `${name} cannot be empty`
-  }).transform((value) => value as Brand<Name>);
+  }).transform((value) => value.trim() as Brand<Name>);
 
 export const workflowId = (value: string): WorkflowId => createId('WorkflowId', value);
 export const taskId = (value: string): TaskId => createId('TaskId', value);
