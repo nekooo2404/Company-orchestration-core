@@ -1,6 +1,5 @@
 import { Pool, type PoolClient } from 'pg';
 import {
-  OutboxCommandSchema,
   type OutboxCommand,
   type Task
 } from '@aicompany/contracts';
@@ -11,6 +10,15 @@ import {
   type TaskRepository
 } from '@aicompany/orchestration-core';
 import {
+  assertVersion,
+  canonicalId,
+  parseOutboxCommand,
+  parseTask,
+  parseTaskId,
+  parseWorkflowId,
+  sameOutboxCommandIdentity
+} from './persistence-validation';
+import {
   saveTaskSnapshot,
   taskFromRow,
   type OutboxCommandRow,
@@ -19,29 +27,9 @@ import {
 
 const clone = <T>(value: T): T => globalThis.structuredClone(value);
 
-const canonicalize = (value: unknown): unknown => {
-  if (value instanceof Date) {
-    return value.toISOString();
-  }
-  if (Array.isArray(value)) {
-    return value.map(canonicalize);
-  }
-  if (value !== null && typeof value === 'object') {
-    return Object.fromEntries(
-      Object.entries(value as Record<string, unknown>)
-        .sort(([left], [right]) => left.localeCompare(right))
-        .map(([key, nestedValue]) => [key, canonicalize(nestedValue)])
-    );
-  }
-  return value;
-};
-
-const sameValue = (left: unknown, right: unknown): boolean =>
-  JSON.stringify(canonicalize(left)) === JSON.stringify(canonicalize(right));
-
 const json = (value: unknown): string => JSON.stringify(value) ?? 'null';
 
-const toOutboxCommand = (row: OutboxCommandRow): OutboxCommand => OutboxCommandSchema.parse({
+const toOutboxCommand = (row: OutboxCommandRow): OutboxCommand => parseOutboxCommand({
   commandId: row.command_id,
   type: row.command_type,
   payload: row.payload,
@@ -53,13 +41,6 @@ const toOutboxCommand = (row: OutboxCommandRow): OutboxCommand => OutboxCommandS
   claimedBy: row.claimed_by,
   claimedAt: row.claimed_at,
   completedAt: row.completed_at
-});
-
-const normalizeOutboxCommand = (command: OutboxCommand): OutboxCommand => ({
-  ...command,
-  claimedBy: command.claimedBy ?? null,
-  claimedAt: command.claimedAt ?? null,
-  completedAt: command.completedAt ?? null
 });
 
 const commandParameters = (command: OutboxCommand): unknown[] => [
@@ -80,6 +61,7 @@ export class PostgresTaskRepository implements TaskRepository {
   public constructor(private readonly pool: Pool) {}
 
   public async get(taskId: string): Promise<Task | null> {
+    const canonicalTaskId = parseTaskId(taskId);
     const result = await this.pool.query<TaskRow>(
       `SELECT task_id, workflow_id, state, dependency_ids, recovery_cycles, version,
               updated_at, required_capabilities, output_contract, budget, project_id,
@@ -87,12 +69,13 @@ export class PostgresTaskRepository implements TaskRepository {
               priority, title, description, is_deployment
        FROM tasks
        WHERE task_id = $1`,
-      [taskId]
+      [canonicalTaskId]
     );
     return result.rowCount === 0 ? null : taskFromRow(result.rows[0]);
   }
 
   public async listByWorkflow(workflowId: string): Promise<Task[]> {
+    const canonicalWorkflowId = parseWorkflowId(workflowId);
     const result = await this.pool.query<TaskRow>(
       `SELECT task_id, workflow_id, state, dependency_ids, recovery_cycles, version,
               updated_at, required_capabilities, output_contract, budget, project_id,
@@ -101,16 +84,18 @@ export class PostgresTaskRepository implements TaskRepository {
        FROM tasks
        WHERE workflow_id = $1
        ORDER BY task_id ASC`,
-      [workflowId]
+      [canonicalWorkflowId]
     );
     return result.rows.map(taskFromRow);
   }
 
   public async save(task: Task, expectedVersion: number): Promise<void> {
+    const parsedTask = parseTask(task);
+    assertVersion(expectedVersion, 'expectedVersion');
     const client = await this.pool.connect();
     try {
       await client.query('BEGIN');
-      await saveTaskSnapshot(client, task, expectedVersion);
+      await saveTaskSnapshot(client, parsedTask, expectedVersion);
       await client.query('COMMIT');
     } catch (error) {
       await client.query('ROLLBACK').catch(() => undefined);
@@ -139,7 +124,7 @@ export class PostgresOutbox implements Outbox {
   }
 
   public async enqueue(command: OutboxCommand): Promise<void> {
-    const parsedCommand = OutboxCommandSchema.parse(command);
+    const parsedCommand = parseOutboxCommand(command);
     const client = await this.pool.connect();
     try {
       await client.query('BEGIN');
@@ -157,9 +142,7 @@ export class PostgresOutbox implements Outbox {
     if (!Number.isInteger(limit) || limit < 0) {
       throw new InvalidPersistenceOperationError('limit must be a non-negative integer');
     }
-    if (workerId.trim().length === 0) {
-      throw new InvalidPersistenceOperationError('workerId cannot be empty');
-    }
+    const canonicalWorkerId = canonicalId(workerId, 'workerId');
     if (limit === 0) {
       return [];
     }
@@ -190,7 +173,7 @@ export class PostgresOutbox implements Outbox {
            WHERE command_id = $1
            RETURNING command_id, command_type, payload, available_at, claimed_by, claimed_at,
                      completed_at, actor, issued_at, correlation_id, causation_id`,
-          [row.command_id, workerId]
+           [row.command_id, canonicalWorkerId]
         );
         claimed.push(toOutboxCommand(updated.rows[0]));
       }
@@ -205,18 +188,19 @@ export class PostgresOutbox implements Outbox {
   }
 
   public async markCompleted(commandId: string): Promise<void> {
+    const canonicalCommandId = canonicalId(commandId, 'commandId');
     const result = await this.pool.query(
       `UPDATE outbox_commands
        SET completed_at = CURRENT_TIMESTAMP
        WHERE command_id = $1 AND completed_at IS NULL`,
-      [commandId]
+      [canonicalCommandId]
     );
     if (result.rowCount === 1) {
       return;
     }
     const exists = await this.pool.query(
       'SELECT 1 FROM outbox_commands WHERE command_id = $1',
-      [commandId]
+      [canonicalCommandId]
     );
     if (exists.rowCount === 0) {
       throw new InvalidPersistenceOperationError(`Outbox command ${commandId} does not exist`);
@@ -227,27 +211,31 @@ export class PostgresOutbox implements Outbox {
     client: PoolClient,
     command: OutboxCommand
   ): Promise<void> {
+    const parsedCommand = parseOutboxCommand(command);
+    await client.query(
+      `INSERT INTO outbox_commands (
+         command_id, command_type, payload, available_at, claimed_by, claimed_at,
+         completed_at, actor, issued_at, correlation_id, causation_id
+       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+       ON CONFLICT (command_id) DO NOTHING`,
+      commandParameters(parsedCommand)
+    );
     const existingResult = await client.query<OutboxCommandRow>(
       `SELECT command_id, command_type, payload, available_at, claimed_by, claimed_at,
               completed_at, actor, issued_at, correlation_id, causation_id
        FROM outbox_commands
        WHERE command_id = $1
        FOR UPDATE`,
-      [command.commandId]
+      [parsedCommand.commandId]
     );
-    if (existingResult.rowCount === 1) {
-      const existing = toOutboxCommand(existingResult.rows[0]);
-      if (!sameValue(existing, normalizeOutboxCommand(command))) {
-        throw new DuplicatePersistenceIdError('outbox command', command.commandId);
-      }
-      return;
+    if (existingResult.rowCount !== 1) {
+      throw new InvalidPersistenceOperationError(
+        `Outbox command ${parsedCommand.commandId} was not persisted`
+      );
     }
-    await client.query(
-      `INSERT INTO outbox_commands (
-         command_id, command_type, payload, available_at, claimed_by, claimed_at,
-         completed_at, actor, issued_at, correlation_id, causation_id
-       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
-      commandParameters(command)
-    );
+    const existing = toOutboxCommand(existingResult.rows[0]);
+    if (!sameOutboxCommandIdentity(existing, parsedCommand)) {
+      throw new DuplicatePersistenceIdError('outbox command', parsedCommand.commandId);
+    }
   }
 }

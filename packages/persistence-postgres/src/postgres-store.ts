@@ -1,7 +1,6 @@
 import { Pool, type PoolClient, type QueryResultRow } from 'pg';
 import {
   DomainEventSchema,
-  OutboxCommandSchema,
   TaskSchema,
   type DomainEvent,
   type EventId,
@@ -12,8 +11,22 @@ import {
   DuplicatePersistenceIdError,
   InvalidPersistenceOperationError,
   OptimisticConcurrencyError,
-  type EventStore
+  type EventStore,
+  type SaveTaskAndAppendInput,
+  type TransactionalPersistence
 } from '@aicompany/orchestration-core';
+import {
+  assertVersion,
+  canonicalId,
+  parseDomainEvent,
+  parseEventId,
+  parseOutboxCommand,
+  parseTask,
+  sameOutboxCommandIdentity,
+  sameValue
+} from './persistence-validation';
+
+export type { SaveTaskAndAppendInput } from '@aicompany/orchestration-core';
 
 export interface DomainEventRow extends QueryResultRow {
   event_id: string;
@@ -65,40 +78,7 @@ export interface OutboxCommandRow extends QueryResultRow {
   causation_id: string;
 }
 
-export interface SaveTaskAndAppendInput {
-  task: Task;
-  expectedVersion: number;
-  events: readonly DomainEvent[];
-  commands: readonly OutboxCommand[];
-}
-
-const canonicalize = (value: unknown): unknown => {
-  if (value instanceof Date) {
-    return value.toISOString();
-  }
-  if (Array.isArray(value)) {
-    return value.map(canonicalize);
-  }
-  if (value !== null && typeof value === 'object') {
-    return Object.fromEntries(
-      Object.entries(value as Record<string, unknown>)
-        .sort(([left], [right]) => left.localeCompare(right))
-        .map(([key, nestedValue]) => [key, canonicalize(nestedValue)])
-    );
-  }
-  return value;
-};
-
-const sameValue = (left: unknown, right: unknown): boolean =>
-  JSON.stringify(canonicalize(left)) === JSON.stringify(canonicalize(right));
-
 const json = (value: unknown): string => JSON.stringify(value) ?? 'null';
-
-const assertVersion = (version: number, name: string): void => {
-  if (!Number.isInteger(version) || version < 0) {
-    throw new InvalidPersistenceOperationError(`${name} must be a non-negative integer`);
-  }
-};
 
 const hydrateEventPayload = (eventType: string, payload: unknown): unknown => {
   if (
@@ -126,7 +106,7 @@ const toDomainEvent = (row: DomainEventRow): DomainEvent => DomainEventSchema.pa
   occurredAt: row.occurred_at
 });
 
-const toOutboxCommand = (row: OutboxCommandRow): OutboxCommand => OutboxCommandSchema.parse({
+const toOutboxCommand = (row: OutboxCommandRow): OutboxCommand => parseOutboxCommand({
   commandId: row.command_id,
   type: row.command_type,
   payload: row.payload,
@@ -138,13 +118,6 @@ const toOutboxCommand = (row: OutboxCommandRow): OutboxCommand => OutboxCommandS
   claimedBy: row.claimed_by,
   claimedAt: row.claimed_at,
   completedAt: row.completed_at
-});
-
-const normalizeOutboxCommand = (command: OutboxCommand): OutboxCommand => ({
-  ...command,
-  claimedBy: command.claimedBy ?? null,
-  claimedAt: command.claimedAt ?? null,
-  completedAt: command.completedAt ?? null
 });
 
 export const taskFromRow = (row: TaskRow): Task => TaskSchema.parse({
@@ -245,7 +218,69 @@ const taskInsertParameters = (task: Task): unknown[] => [
 ];
 
 const aggregateIdForLock = (events: readonly DomainEvent[]): string | undefined =>
-  events.length === 0 ? undefined : DomainEventSchema.parse(events[0]).aggregateId;
+  events.length === 0 ? undefined : events[0].aggregateId;
+
+const parseEventBatch = (events: readonly DomainEvent[]): DomainEvent[] => {
+  const parsedEvents = events.map(parseDomainEvent);
+  if (parsedEvents.length === 0) {
+    return parsedEvents;
+  }
+
+  const aggregateId = parsedEvents[0].aggregateId;
+  const seenIds = new Set<string>();
+  for (const event of parsedEvents) {
+    if (event.aggregateId !== aggregateId) {
+      throw new InvalidPersistenceOperationError('An event append must target one aggregate');
+    }
+    if (seenIds.has(event.eventId)) {
+      throw new DuplicatePersistenceIdError('event', event.eventId);
+    }
+    seenIds.add(event.eventId);
+  }
+  return parsedEvents;
+};
+
+interface PreparedSaveTaskAndAppendInput {
+  task: Task;
+  expectedVersion: number;
+  events: DomainEvent[];
+  commands: OutboxCommand[];
+}
+
+const prepareSaveTaskAndAppend = (
+  input: SaveTaskAndAppendInput
+): PreparedSaveTaskAndAppendInput => {
+  assertVersion(input.expectedVersion, 'expectedVersion');
+  const task = parseTask(input.task);
+  const events = parseEventBatch(input.events);
+  const commands = input.commands.map(parseOutboxCommand);
+
+  const initialTaskVersion = input.expectedVersion === 0 && task.version === 0;
+  const updatedTaskVersion = task.version === input.expectedVersion + 1;
+  if (!initialTaskVersion && !updatedTaskVersion) {
+    throw new InvalidPersistenceOperationError(
+      `Task ${task.id} must have version 0 for a new task or ${input.expectedVersion + 1}`
+    );
+  }
+
+  if (events.length > 0) {
+    if (events[0].aggregateId !== task.id) {
+      throw new InvalidPersistenceOperationError(
+        `Task ${task.id} does not match event aggregate ${events[0].aggregateId}`
+      );
+    }
+    events.forEach((event, index) => {
+      const expectedEventVersion = input.expectedVersion + index + 1;
+      if (event.aggregateVersion !== expectedEventVersion) {
+        throw new InvalidPersistenceOperationError(
+          `Event ${event.eventId} must have aggregate version ${expectedEventVersion}`
+        );
+      }
+    });
+  }
+
+  return { task, expectedVersion: input.expectedVersion, events, commands };
+};
 
 const lockAggregate = async (client: PoolClient, aggregateId: string): Promise<void> => {
   await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [aggregateId]);
@@ -257,7 +292,7 @@ export const saveTaskSnapshot = async (
   expectedVersion: number
 ): Promise<void> => {
   assertVersion(expectedVersion, 'expectedVersion');
-  const validatedTask = TaskSchema.parse(task);
+  const validatedTask = parseTask(task);
   const existing = await client.query<{ version: number }>(
     'SELECT version FROM tasks WHERE task_id = $1 FOR UPDATE',
     [validatedTask.id]
@@ -308,21 +343,23 @@ export const saveTaskSnapshot = async (
   }
 }
 
-export class PostgresStore implements EventStore {
+export class PostgresStore implements EventStore, TransactionalPersistence {
   public constructor(private readonly pool: Pool) {}
 
   public async append(events: readonly DomainEvent[], expectedVersion: number): Promise<void> {
-    if (events.length === 0) {
+    assertVersion(expectedVersion, 'expectedVersion');
+    const parsedEvents = parseEventBatch(events);
+    if (parsedEvents.length === 0) {
       return;
     }
     const client = await this.pool.connect();
     try {
       await client.query('BEGIN');
-      const aggregateId = aggregateIdForLock(events);
+      const aggregateId = aggregateIdForLock(parsedEvents);
       if (aggregateId !== undefined) {
         await lockAggregate(client, aggregateId);
       }
-      await this.appendEvents(client, events, expectedVersion);
+      await this.appendEvents(client, parsedEvents, expectedVersion);
       await client.query('COMMIT');
     } catch (error) {
       await client.query('ROLLBACK').catch(() => undefined);
@@ -334,36 +371,39 @@ export class PostgresStore implements EventStore {
 
   public async readStream(aggregateId: string, afterVersion = 0): Promise<DomainEvent[]> {
     assertVersion(afterVersion, 'afterVersion');
+    const canonicalAggregateId = canonicalId(aggregateId, 'aggregateId');
     const result = await this.pool.query<DomainEventRow>(
       `SELECT event_id, aggregate_type, aggregate_id, aggregate_version, event_type, payload, actor,
               correlation_id, causation_id, occurred_at
        FROM domain_events
        WHERE aggregate_id = $1 AND aggregate_version > $2
        ORDER BY aggregate_version ASC`,
-      [aggregateId, afterVersion]
+      [canonicalAggregateId, afterVersion]
     );
     return result.rows.map(toDomainEvent);
   }
 
   public async hasEvent(eventId: EventId): Promise<boolean> {
+    const canonicalEventId = parseEventId(eventId);
     const result = await this.pool.query(
       'SELECT 1 FROM domain_events WHERE event_id = $1',
-      [eventId]
+      [canonicalEventId]
     );
     return result.rowCount === 1;
   }
 
   public async saveTaskAndAppend(input: SaveTaskAndAppendInput): Promise<void> {
+    const prepared = prepareSaveTaskAndAppend(input);
     const client = await this.pool.connect();
     try {
       await client.query('BEGIN');
-      const aggregateId = aggregateIdForLock(input.events);
+      const aggregateId = aggregateIdForLock(prepared.events);
       if (aggregateId !== undefined) {
         await lockAggregate(client, aggregateId);
       }
-      await saveTaskSnapshot(client, input.task, input.expectedVersion);
-      await this.appendEvents(client, input.events, input.expectedVersion);
-      await this.enqueueCommands(client, input.commands);
+      await saveTaskSnapshot(client, prepared.task, prepared.expectedVersion);
+      await this.appendEvents(client, prepared.events, prepared.expectedVersion);
+      await this.enqueueCommands(client, prepared.commands);
       await client.query('COMMIT');
     } catch (error) {
       await client.query('ROLLBACK').catch(() => undefined);
@@ -387,7 +427,7 @@ export class PostgresStore implements EventStore {
       return;
     }
 
-    const parsedEvents = events.map((event) => DomainEventSchema.parse(event));
+    const parsedEvents = events;
     const aggregateId = parsedEvents[0].aggregateId;
     const seenIds = new Set<string>();
     for (const event of parsedEvents) {
@@ -456,7 +496,15 @@ export class PostgresStore implements EventStore {
     commands: readonly OutboxCommand[]
   ): Promise<void> {
     for (const command of commands) {
-      const parsedCommand = OutboxCommandSchema.parse(command);
+      const parsedCommand = parseOutboxCommand(command);
+      await client.query(
+        `INSERT INTO outbox_commands (
+           command_id, command_type, payload, available_at, claimed_by, claimed_at,
+           completed_at, actor, issued_at, correlation_id, causation_id
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+         ON CONFLICT (command_id) DO NOTHING`,
+        commandParameters(parsedCommand)
+      );
       const existingResult = await client.query<OutboxCommandRow>(
         `SELECT command_id, command_type, payload, available_at, claimed_by, claimed_at,
                 completed_at, actor, issued_at, correlation_id, causation_id
@@ -464,20 +512,15 @@ export class PostgresStore implements EventStore {
          WHERE command_id = $1`,
         [parsedCommand.commandId]
       );
-      if (existingResult.rowCount === 1) {
-        const existing = toOutboxCommand(existingResult.rows[0]);
-        if (!sameValue(existing, normalizeOutboxCommand(parsedCommand))) {
-          throw new DuplicatePersistenceIdError('outbox command', parsedCommand.commandId);
-        }
-        continue;
+      if (existingResult.rowCount !== 1) {
+        throw new InvalidPersistenceOperationError(
+          `Outbox command ${parsedCommand.commandId} was not persisted`
+        );
       }
-      await client.query(
-        `INSERT INTO outbox_commands (
-           command_id, command_type, payload, available_at, claimed_by, claimed_at,
-           completed_at, actor, issued_at, correlation_id, causation_id
-         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
-        commandParameters(parsedCommand)
-      );
+      const existing = toOutboxCommand(existingResult.rows[0]);
+      if (!sameOutboxCommandIdentity(existing, parsedCommand)) {
+        throw new DuplicatePersistenceIdError('outbox command', parsedCommand.commandId);
+      }
     }
   }
 }

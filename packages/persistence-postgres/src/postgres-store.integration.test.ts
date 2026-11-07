@@ -12,19 +12,14 @@ import {
   type OutboxCommand,
   type Task
 } from '@aicompany/contracts';
-import type { TaskRepository } from '@aicompany/orchestration-core';
+import type {
+  EventStore,
+  TaskRepository,
+  TransactionalPersistence
+} from '@aicompany/orchestration-core';
 import * as persistence from './index';
 
-type PostgresStoreContract = {
-  append(events: readonly DomainEvent[], expectedVersion: number): Promise<void>;
-  readStream(aggregateId: string, afterVersion?: number): Promise<DomainEvent[]>;
-  hasEvent(eventId: string): Promise<boolean>;
-  saveTaskAndAppend(input: {
-    task: Task;
-    expectedVersion: number;
-    events: readonly DomainEvent[];
-    commands: readonly OutboxCommand[];
-  }): Promise<void>;
+type PostgresStoreContract = EventStore & TransactionalPersistence & {
   close(): Promise<void>;
 };
 
@@ -87,7 +82,7 @@ const makeCommand = (commandIdentifier: string, overrides: Partial<OutboxCommand
   payload: { taskId: taskId('task-1'), recoveryId: `recovery-${commandIdentifier}` },
   actor: { kind: 'SYSTEM', name: 'integration-test' },
   issuedAt: now,
-  availableAt: new Date(Date.now() - 60_000),
+  availableAt: new Date('2000-01-01T00:00:00.000Z'),
   correlationId: correlationId('correlation-1'),
   causationId: eventId('event-1'),
   ...overrides
@@ -176,6 +171,23 @@ integration('PostgreSQL persistence', () => {
   });
 
   it('rolls back task, event and outbox writes on a version conflict', async () => {
+    await expect(
+      store.saveTaskAndAppend({
+        task: makeTask({ id: taskId('task-mismatch') }),
+        expectedVersion: 0,
+        events: [makeEvent(1, 'event-mismatch')],
+        commands: []
+      })
+    ).rejects.toThrow(/aggregate|task/i);
+    await expect(
+      store.saveTaskAndAppend({
+        task: makeTask(),
+        expectedVersion: 0,
+        events: [makeEvent(2, 'event-version-mismatch')],
+        commands: []
+      })
+    ).rejects.toThrow(/version/i);
+
     await store.append([makeEvent(1)], 0);
     const original = makeTask();
     await tasks.save(original, 0);
@@ -223,13 +235,93 @@ integration('PostgreSQL persistence', () => {
   });
 
   it('does not deliver an uncompleted command to two workers and reclaims a stale lease', async () => {
+    const concurrent = makeCommand('command-concurrent-enqueue');
+    await expect(
+      Promise.all([outbox.enqueue(concurrent), outbox.enqueue(structuredClone(concurrent))])
+    ).resolves.toEqual([undefined, undefined]);
+    expect((await outbox.claim(2, 'enqueue-check')).map((command) => command.commandId)).toEqual([
+      'command-concurrent-enqueue'
+    ]);
+
     await outbox.enqueue(makeCommand('command-exclusive'));
     const [workerA, workerB] = await Promise.all([
       outbox.claim(1, 'worker-a'),
       outbox.claim(1, 'worker-b')
     ]);
     expect(workerA.length + workerB.length).toBe(1);
+    const claimed = workerA[0] ?? workerB[0];
+    expect(claimed).toBeDefined();
+    const claimedState = await pool.query(
+      `SELECT claimed_by, claimed_at, completed_at
+       FROM outbox_commands
+       WHERE command_id = $1`,
+      ['command-exclusive']
+    );
+    await expect(outbox.enqueue(makeCommand('command-exclusive'))).resolves.toBeUndefined();
+    expect(await outbox.claim(1, 'worker-c')).toEqual([]);
+    await expect(
+      pool.query(
+        `SELECT claimed_by, claimed_at, completed_at
+         FROM outbox_commands
+         WHERE command_id = $1`,
+        ['command-exclusive']
+      )
+    ).resolves.toEqual(claimedState);
     await outbox.markCompleted('command-exclusive');
+    const completedState = await pool.query(
+      `SELECT claimed_by, claimed_at, completed_at
+       FROM outbox_commands
+       WHERE command_id = $1`,
+      ['command-exclusive']
+    );
+    expect(await outbox.claim(1, 'worker-c')).toEqual([]);
+    await expect(outbox.enqueue(makeCommand('command-exclusive'))).resolves.toBeUndefined();
+    expect(await outbox.claim(1, 'worker-c')).toEqual([]);
+    await expect(
+      pool.query(
+        `SELECT claimed_by, claimed_at, completed_at
+         FROM outbox_commands
+         WHERE command_id = $1`,
+        ['command-exclusive']
+      )
+    ).resolves.toEqual(completedState);
+
+    await expect(
+      outbox.enqueue(
+        makeCommand('command-exclusive', {
+          payload: { taskId: taskId('task-1'), recoveryId: 'different-recovery' }
+        })
+      )
+    ).rejects.toThrow(/duplicate|different/i);
+
+    await expect(
+      outbox.enqueue(makeCommand('command-partial', { claimedBy: 'worker-only' }))
+    ).rejects.toThrow();
+    await expect(
+      outbox.enqueue(makeCommand('command-partial-at', { claimedAt: now }))
+    ).rejects.toThrow();
+    const sqlPartial = makeCommand('command-sql-partial', { claimedBy: 'worker-only' });
+    await expect(
+      pool.query(
+        `INSERT INTO outbox_commands (
+           command_id, command_type, payload, available_at, claimed_by, claimed_at,
+           completed_at, actor, issued_at, correlation_id, causation_id
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+        [
+          sqlPartial.commandId,
+          sqlPartial.type,
+          JSON.stringify(sqlPartial.payload),
+          sqlPartial.availableAt,
+          sqlPartial.claimedBy,
+          null,
+          null,
+          JSON.stringify(sqlPartial.actor),
+          sqlPartial.issuedAt,
+          sqlPartial.correlationId,
+          sqlPartial.causationId
+        ]
+      )
+    ).rejects.toThrow();
 
     await outbox.enqueue(
       makeCommand('command-stale', {

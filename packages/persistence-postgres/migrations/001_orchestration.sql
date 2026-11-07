@@ -60,8 +60,7 @@ CREATE TABLE IF NOT EXISTS domain_events (
 CREATE UNIQUE INDEX IF NOT EXISTS domain_events_aggregate_version
   ON domain_events (aggregate_id, aggregate_version);
 
-CREATE INDEX IF NOT EXISTS domain_events_aggregate_stream
-  ON domain_events (aggregate_id, aggregate_version);
+DROP INDEX IF EXISTS domain_events_aggregate_stream;
 
 CREATE TABLE IF NOT EXISTS outbox_commands (
   command_id text PRIMARY KEY,
@@ -74,8 +73,25 @@ CREATE TABLE IF NOT EXISTS outbox_commands (
   actor jsonb NOT NULL,
   issued_at timestamptz NOT NULL,
   correlation_id text NOT NULL,
-  causation_id text NOT NULL
+  causation_id text NOT NULL,
+  CONSTRAINT outbox_commands_claimed_lease_complete
+    CHECK ((claimed_by IS NULL) = (claimed_at IS NULL))
 );
+
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1
+    FROM pg_constraint
+    WHERE conrelid = 'outbox_commands'::regclass
+      AND conname = 'outbox_commands_claimed_lease_complete'
+  ) THEN
+    ALTER TABLE outbox_commands
+      ADD CONSTRAINT outbox_commands_claimed_lease_complete
+      CHECK ((claimed_by IS NULL) = (claimed_at IS NULL));
+  END IF;
+END
+$$;
 
 CREATE INDEX IF NOT EXISTS outbox_commands_claimable
   ON outbox_commands (available_at, command_id)

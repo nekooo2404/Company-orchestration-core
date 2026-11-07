@@ -1,7 +1,8 @@
 import type {
   DomainEvent,
   EventId,
-  OutboxCommand as ContractOutboxCommand
+  OutboxCommand as ContractOutboxCommand,
+  Task
 } from '@aicompany/contracts';
 export type { TaskRepository } from './repository';
 
@@ -12,6 +13,17 @@ export interface EventStore {
 }
 
 export type OutboxCommand = ContractOutboxCommand;
+
+export interface SaveTaskAndAppendInput {
+  task: Task;
+  expectedVersion: number;
+  events: readonly DomainEvent[];
+  commands: readonly OutboxCommand[];
+}
+
+export interface TransactionalPersistence {
+  saveTaskAndAppend(input: SaveTaskAndAppendInput): Promise<void>;
+}
 
 export interface Outbox {
   enqueue(command: OutboxCommand): Promise<void>;

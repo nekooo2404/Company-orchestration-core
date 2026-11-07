@@ -40,6 +40,58 @@ const canonicalize = (value: unknown): unknown => {
 const sameValue = (left: unknown, right: unknown): boolean =>
   JSON.stringify(canonicalize(left)) === JSON.stringify(canonicalize(right));
 
+const canonicalId = (value: string, name: string): string => {
+  if (typeof value !== 'string' || value.trim().length === 0) {
+    throw new InvalidPersistenceOperationError(`${name} cannot be empty`);
+  }
+  return value.trim();
+};
+
+const parseDomainEvent = (event: DomainEvent): DomainEvent => {
+  const parsed = DomainEventSchema.parse(event);
+  return { ...parsed, aggregateId: canonicalId(parsed.aggregateId, 'aggregateId') };
+};
+
+const parseOutboxCommand = (command: OutboxCommand): OutboxCommand => {
+  const parsed = OutboxCommandSchema.parse(command);
+  const hasClaimedBy = parsed.claimedBy !== undefined && parsed.claimedBy !== null;
+  const hasClaimedAt = parsed.claimedAt !== undefined && parsed.claimedAt !== null;
+  if (hasClaimedBy !== hasClaimedAt) {
+    throw new InvalidPersistenceOperationError(
+      'claimedBy and claimedAt must be provided together'
+    );
+  }
+  return {
+    ...parsed,
+    commandId: canonicalId(parsed.commandId, 'commandId'),
+    ...(hasClaimedBy ? { claimedBy: canonicalId(parsed.claimedBy!, 'claimedBy') } : {})
+  };
+};
+
+const sameOutboxCommandIdentity = (left: OutboxCommand, right: OutboxCommand): boolean =>
+  sameValue(
+    {
+      commandId: left.commandId,
+      type: left.type,
+      payload: left.payload,
+      actor: left.actor,
+      issuedAt: left.issuedAt,
+      availableAt: left.availableAt,
+      correlationId: left.correlationId,
+      causationId: left.causationId
+    },
+    {
+      commandId: right.commandId,
+      type: right.type,
+      payload: right.payload,
+      actor: right.actor,
+      issuedAt: right.issuedAt,
+      availableAt: right.availableAt,
+      correlationId: right.correlationId,
+      causationId: right.causationId
+    }
+  );
+
 const assertVersion = (version: number, name: string): void => {
   if (!Number.isInteger(version) || version < 0) {
     throw new InvalidPersistenceOperationError(`${name} must be a non-negative integer`);
@@ -56,7 +108,7 @@ export class InMemoryEventStore implements EventStore {
       return;
     }
 
-    const parsedEvents = events.map((event) => DomainEventSchema.parse(event));
+    const parsedEvents = events.map(parseDomainEvent);
 
     const aggregateId = parsedEvents[0].aggregateId;
     const seenIds = new Set<string>();
@@ -112,7 +164,8 @@ export class InMemoryEventStore implements EventStore {
 
   public async readStream(aggregateId: string, afterVersion = 0): Promise<DomainEvent[]> {
     assertVersion(afterVersion, 'afterVersion');
-    return (this.streams.get(aggregateId) ?? [])
+    const canonicalAggregateId = canonicalId(aggregateId, 'aggregateId');
+    return (this.streams.get(canonicalAggregateId) ?? [])
       .filter((event) => event.aggregateVersion > afterVersion)
       .map(clone);
   }
@@ -181,10 +234,10 @@ export class InMemoryOutbox implements Outbox {
   }
 
   public async enqueue(command: OutboxCommand): Promise<void> {
-    const parsedCommand = OutboxCommandSchema.parse(command);
+    const parsedCommand = parseOutboxCommand(command);
     const existing = this.commands.get(parsedCommand.commandId);
     if (existing !== undefined) {
-      if (!sameValue(existing, parsedCommand)) {
+      if (!sameOutboxCommandIdentity(existing, parsedCommand)) {
         throw new DuplicatePersistenceIdError('outbox command', parsedCommand.commandId);
       }
       return;
@@ -196,9 +249,7 @@ export class InMemoryOutbox implements Outbox {
     if (!Number.isInteger(limit) || limit < 0) {
       throw new InvalidPersistenceOperationError('limit must be a non-negative integer');
     }
-    if (workerId.trim().length === 0) {
-      throw new InvalidPersistenceOperationError('workerId cannot be empty');
-    }
+    const canonicalWorkerId = canonicalId(workerId, 'workerId');
 
     const currentTime = this.now();
     const staleBefore = currentTime.getTime() - this.leaseDurationMs;
@@ -226,7 +277,7 @@ export class InMemoryOutbox implements Outbox {
     return candidates.map((command) => {
       const claimed = {
         ...command,
-        claimedBy: workerId,
+        claimedBy: canonicalWorkerId,
         claimedAt: clone(currentTime)
       };
       this.commands.set(command.commandId, claimed);
@@ -235,14 +286,17 @@ export class InMemoryOutbox implements Outbox {
   }
 
   public async markCompleted(commandId: string): Promise<void> {
-    const command = this.commands.get(commandId);
+    const canonicalCommandId = canonicalId(commandId, 'commandId');
+    const command = this.commands.get(canonicalCommandId);
     if (command === undefined) {
-      throw new InvalidPersistenceOperationError(`Outbox command ${commandId} does not exist`);
+      throw new InvalidPersistenceOperationError(
+        `Outbox command ${canonicalCommandId} does not exist`
+      );
     }
     if (command.completedAt !== undefined && command.completedAt !== null) {
       return;
     }
-    this.commands.set(commandId, {
+    this.commands.set(canonicalCommandId, {
       ...command,
       completedAt: clone(this.now())
     });

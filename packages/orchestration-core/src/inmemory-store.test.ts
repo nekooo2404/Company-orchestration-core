@@ -14,6 +14,7 @@ import {
   InMemoryEventStore,
   InMemoryOutbox,
   InMemoryTaskRepository,
+  InvalidPersistenceOperationError,
   OptimisticConcurrencyError
 } from './test-support/inmemory-store';
 
@@ -122,8 +123,13 @@ describe('in-memory persistence adapters', () => {
     expect(firstClaim).toHaveLength(1);
     expect(await outbox.claim(1, 'worker-b')).toEqual([]);
 
+    await expect(outbox.enqueue(makeCommand('command-1'))).resolves.toBeUndefined();
+    expect(await outbox.claim(1, 'worker-c')).toEqual([]);
+
     await outbox.markCompleted('command-1');
     expect(await outbox.claim(1, 'worker-b')).toEqual([]);
+    await expect(outbox.enqueue(makeCommand('command-1'))).resolves.toBeUndefined();
+    expect(await outbox.claim(1, 'worker-c')).toEqual([]);
 
     await outbox.enqueue(
       makeCommand('command-2', {
@@ -133,6 +139,20 @@ describe('in-memory persistence adapters', () => {
     );
     const recoveredClaim = await outbox.claim(1, 'worker-b');
     expect(recoveredClaim.map((command) => command.commandId)).toEqual(['command-2']);
+  });
+
+  it('rejects partial outbox lease state and invalid persistence IDs', async () => {
+    const store = new InMemoryEventStore();
+    const outbox = new InMemoryOutbox();
+
+    await expect(
+      outbox.enqueue(makeCommand('partial-by', { claimedBy: 'worker-a' }))
+    ).rejects.toBeInstanceOf(InvalidPersistenceOperationError);
+    await expect(
+      outbox.enqueue(makeCommand('partial-at', { claimedAt: now }))
+    ).rejects.toBeInstanceOf(InvalidPersistenceOperationError);
+    await expect(store.readStream('   ')).rejects.toBeInstanceOf(InvalidPersistenceOperationError);
+    await expect(outbox.markCompleted('   ')).rejects.toBeInstanceOf(InvalidPersistenceOperationError);
   });
 
   it('parses canonical contracts at persistence boundaries', async () => {
