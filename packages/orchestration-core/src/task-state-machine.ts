@@ -1,4 +1,5 @@
 import {
+  DomainEventSchema,
   approvalId,
   eventId,
   type ActorRef,
@@ -55,15 +56,25 @@ const TRANSITION_TABLE: Readonly<Record<TaskState, ReadonlySet<TransitionType>>>
     'TASK_CANCELLED'
   ),
   COMPLETED: transitions(),
-  BLOCKED: transitions('RECOVERY_STARTED', 'TASK_ESCALATED', 'TASK_CANCELLED'),
+  BLOCKED: transitions('RECOVERY_STARTED', 'TASK_CANCELLED'),
   RECOVERING: transitions('TASK_READY', 'TASK_FAILED', 'TASK_ESCALATED', 'TASK_CANCELLED'),
-  FAILED: transitions('RECOVERY_STARTED', 'TASK_ESCALATED', 'TASK_CANCELLED'),
+  FAILED: transitions('RECOVERY_STARTED', 'TASK_CANCELLED'),
   ESCALATED_TO_CEO: transitions(),
   CANCELLED: transitions(),
   WAITING_FOR_APPROVAL: transitions('TASK_CANCELLED')
 };
 
 const nonEmpty = (value: string): boolean => value.trim().length > 0;
+
+const deepFreeze = <T>(value: T): T => {
+  if (value !== null && typeof value === 'object' && !Object.isFrozen(value)) {
+    for (const nestedValue of Object.values(value as Record<string, unknown>)) {
+      deepFreeze(nestedValue);
+    }
+    Object.freeze(value);
+  }
+  return value;
+};
 
 const invalid = (
   task: Task,
@@ -73,14 +84,13 @@ const invalid = (
   throw new InvalidTaskTransitionError(task.id, task.state, transition.type, reason);
 };
 
-const freezeTask = (task: Task): Task => Object.freeze({
-  ...task,
-  dependencyIds: Object.freeze([...task.dependencyIds]),
-  requiredCapabilities: Object.freeze([...task.requiredCapabilities]),
-  budget: Object.freeze({ ...task.budget })
-}) as unknown as Task;
+const freezeTask = (task: Task): Task => {
+  return deepFreeze(globalThis.structuredClone(task));
+};
 
-const freezeEvent = (event: DomainEvent): DomainEvent => Object.freeze(event) as DomainEvent;
+const freezeEvent = (event: DomainEvent): DomainEvent => {
+  return deepFreeze(globalThis.structuredClone(event));
+};
 
 const eventIdentifiers = (task: Task, nextVersion: number) => ({
   eventId: eventId(`task:${task.id}:v${nextVersion}`),
@@ -90,11 +100,24 @@ const eventIdentifiers = (task: Task, nextVersion: number) => ({
 const deploymentApprovalId = (task: Task, nextVersion: number): ApprovalId =>
   approvalId(`deployment:${task.id}:v${nextVersion}`);
 
+const resolveDeploymentMode = (
+  task: Task,
+  transition: TaskTransition,
+  context: TransitionContext
+): boolean => {
+  if (task.isDeployment !== undefined && task.isDeployment !== context.isDeployment) {
+    invalid(task, transition, 'task and transition context deployment flags disagree');
+  }
+  return task.isDeployment ?? context.isDeployment;
+};
+
 export function transitionTask(
   task: Task,
   transition: TaskTransition,
   context: TransitionContext
 ): TransitionResult {
+  const isDeployment = resolveDeploymentMode(task, transition, context);
+
   if (!TRANSITION_TABLE[task.state].has(transition.type)) {
     invalid(task, transition, 'transition is not allowed from the current state');
   }
@@ -134,7 +157,7 @@ export function transitionTask(
         invalid(task, transition, 'completion requires at least one evidence ID');
       }
 
-      if (context.isDeployment) {
+      if (isDeployment) {
         nextState = 'WAITING_FOR_APPROVAL';
         eventType = 'DEPLOYMENT_APPROVAL_REQUESTED';
         payload = {
@@ -186,6 +209,9 @@ export function transitionTask(
       if (!nonEmpty(transition.reason)) {
         invalid(task, transition, 'escalation requires a reason');
       }
+      if (task.state !== 'RECOVERING' || task.recoveryCycles !== 5) {
+        invalid(task, transition, 'normal escalation requires the fifth recovery cycle');
+      }
       nextState = 'ESCALATED_TO_CEO';
       eventType = 'TASK_ESCALATED';
       payload = { reason: transition.reason, taskId: task.id };
@@ -199,7 +225,7 @@ export function transitionTask(
       payload = { reason: transition.reason, taskId: task.id };
       break;
     case 'APPROVAL_REQUESTED':
-      if (!context.isDeployment) {
+      if (!isDeployment) {
         invalid(task, transition, 'approval requests are only valid for deployment tasks');
       }
       nextState = 'WAITING_FOR_APPROVAL';
@@ -216,7 +242,7 @@ export function transitionTask(
     updatedAt: context.now
   });
   const identifiers = eventIdentifiers(task, nextVersion);
-  const event = freezeEvent({
+  const event = freezeEvent(DomainEventSchema.parse({
     ...identifiers,
     aggregateType: 'TASK',
     aggregateId: task.id,
@@ -226,7 +252,7 @@ export function transitionTask(
     correlationId: task.traceId,
     occurredAt: context.now,
     payload
-  } as DomainEvent);
+  }));
 
   return { task: nextTask, event };
 }

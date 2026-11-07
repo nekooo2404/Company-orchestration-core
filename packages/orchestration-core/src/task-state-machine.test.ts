@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   DomainEventSchema,
   type Task,
+  type AgentSessionId,
   agentSessionId,
   approvalId,
   correlationId,
@@ -53,7 +54,7 @@ describe('transitionTask', () => {
     expect(task.state).toBe('PENDING');
     expect(result.task.state).toBe('READY');
     expect(result.task.version).toBe(5);
-    expect(result.task.updatedAt).toBe(now);
+    expect(result.task.updatedAt).toEqual(now);
     expect(result.event.eventType).toBe('TASK_READY');
     expect(result.event.aggregateVersion).toBe(5);
     expect(DomainEventSchema.safeParse(result.event).success).toBe(true);
@@ -156,6 +157,18 @@ describe('transitionTask', () => {
     expect(DomainEventSchema.safeParse(result.event).success).toBe(true);
   });
 
+  it('rejects a deployment flag mismatch instead of allowing completion', () => {
+    const deploymentTask = makeTask({ state: 'REVIEW', isDeployment: true });
+
+    expect(() =>
+      transitionTask(
+        deploymentTask,
+        { type: 'TASK_COMPLETED', evidenceIds: ['staging-artifact'] },
+        context
+      )
+    ).toThrow(InvalidTaskTransitionError);
+  });
+
   it('accepts an explicit deployment approval request with its approval ID', () => {
     const result = transitionTask(
       makeTask({ state: 'REVIEW' }),
@@ -169,5 +182,92 @@ describe('transitionTask', () => {
       approvalId: 'approval-1',
       taskId: 'task-1'
     });
+  });
+
+  it('only escalates a recovering task after the fifth recovery cycle', () => {
+    const escalation = { type: 'TASK_ESCALATED' as const, reason: 'recoveries exhausted' };
+
+    expect(() => transitionTask(makeTask({ state: 'BLOCKED' }), escalation, context))
+      .toThrow(InvalidTaskTransitionError);
+    expect(() => transitionTask(makeTask({ state: 'FAILED' }), escalation, context))
+      .toThrow(InvalidTaskTransitionError);
+    expect(() => transitionTask(makeTask({ state: 'RECOVERING', recoveryCycles: 4 }), escalation, context))
+      .toThrow(InvalidTaskTransitionError);
+
+    const result = transitionTask(
+      makeTask({ state: 'RECOVERING', recoveryCycles: 5 }),
+      escalation,
+      context
+    );
+
+    expect(result.task.state).toBe('ESCALATED_TO_CEO');
+  });
+
+  it('rejects malformed actor and timestamp input through the canonical event schema', () => {
+    const malformedActorContext = {
+      ...context,
+      actor: { kind: 'SYSTEM', name: '   ' }
+    } as TransitionContext;
+    const malformedDateContext = {
+      ...context,
+      now: new Date(Number.NaN)
+    };
+
+    expect(() => transitionTask(makeTask(), { type: 'TASK_READY' }, malformedActorContext))
+      .toThrow();
+    expect(() => transitionTask(makeTask(), { type: 'TASK_READY' }, malformedDateContext))
+      .toThrow();
+  });
+
+  it('rejects malformed event payload IDs through the canonical event schema', () => {
+    const malformedSessionId = '' as AgentSessionId;
+
+    expect(() =>
+      transitionTask(
+        makeTask({ state: 'READY' }),
+        { type: 'TASK_STARTED', sessionId: malformedSessionId },
+        context
+      )
+    ).toThrow();
+  });
+
+  it('deep-freezes cloned task and event snapshots', () => {
+    const deadline = new Date('2026-11-09T00:00:00.000Z');
+    const task = makeTask({
+      state: 'REVIEW',
+      dependencyIds: [taskId('dependency-1')],
+      budget: { maxTokens: 1000, maxCostUsd: 1 },
+      deadline
+    });
+    const evidenceIds = ['evidence-1'];
+    const result = transitionTask(
+      task,
+      { type: 'TASK_COMPLETED', evidenceIds },
+      { ...context, evidenceIds: ['review-evidence'] }
+    );
+
+    expect(result.task.createdAt).not.toBe(task.createdAt);
+    expect(result.task.updatedAt).not.toBe(task.updatedAt);
+    expect(result.task.deadline).not.toBe(task.deadline);
+    expect(result.task.dependencyIds).not.toBe(task.dependencyIds);
+    expect(result.task.budget).not.toBe(task.budget);
+    expect(Object.isFrozen(result.task.dependencyIds)).toBe(true);
+    expect(Object.isFrozen(result.task.budget)).toBe(true);
+    expect(() => result.task.dependencyIds.push(taskId('another'))).toThrow();
+    expect(() => { result.task.budget.maxTokens = 2_000; }).toThrow();
+
+    if (result.event.eventType !== 'TASK_COMPLETED') {
+      throw new Error('Expected a task-completed event');
+    }
+    expect(result.event.occurredAt).not.toBe(context.now);
+    expect(Object.isFrozen(result.event.payload)).toBe(true);
+    expect(Object.isFrozen(result.event.payload.evidenceIds)).toBe(true);
+    expect(result.event.payload.evidenceIds).not.toBe(evidenceIds);
+    expect(() => result.event.payload.evidenceIds.push('another')).toThrow();
+
+    result.task.updatedAt.setTime(new Date('2027-01-01T00:00:00.000Z').getTime());
+    result.event.occurredAt.setTime(new Date('2027-01-01T00:00:00.000Z').getTime());
+    expect(task.updatedAt).toEqual(now);
+    expect(context.now).toEqual(now);
   });
 });
