@@ -39,6 +39,15 @@ importers:
         specifier: workspace:*
         version: link:../contracts
 
+  packages/orchestration-harness:
+    dependencies:
+      '@aicompany/contracts':
+        specifier: workspace:*
+        version: link:../contracts
+      '@aicompany/orchestration-core':
+        specifier: workspace:*
+        version: link:../orchestration-core
+
   packages/persistence-postgres:
     dependencies:
       '@aicompany/contracts':

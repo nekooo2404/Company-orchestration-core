@@ -3,6 +3,7 @@
   "references": [
     { "path": "./packages/contracts" },
     { "path": "./packages/orchestration-core" },
+    { "path": "./packages/orchestration-harness" },
     { "path": "./packages/persistence-postgres" }
   ]
 }

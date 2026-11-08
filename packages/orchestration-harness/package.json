@@ -1,0 +1,14 @@
+{
+  "name": "@aicompany/orchestration-harness",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "vitest run --config vitest.config.ts",
+    "typecheck": "tsc -b"
+  },
+  "dependencies": {
+    "@aicompany/contracts": "workspace:*",
+    "@aicompany/orchestration-core": "workspace:*"
+  }
+}
