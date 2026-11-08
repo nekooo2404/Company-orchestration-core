@@ -24,4 +24,6 @@ export { DEFAULT_CAPABILITY_POLICY, InMemoryCapabilityPolicy } from './capabilit
 export type { CapabilityRequest, CapabilityDecision, CapabilityPolicy as CapabilityEvaluationPolicy } from './capability-policy';
 export * from './approvals';
 export * from './ceo-commands';
+export * from './observability';
+export * from './cost';
 export * from './test-support/inmemory-store';
