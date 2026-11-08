@@ -15,11 +15,12 @@ import type { CheckpointStore } from './checkpoints.js';
 export interface AgentSessionRepository {
   get(sessionId: AgentSessionId): Promise<AgentSession | null>;
   findByTask(taskId: Task['id'], idempotencyKey: string): Promise<AgentSession | null>;
-  startFingerprint(taskId: Task['id'], idempotencyKey: string): string | null;
+  startFingerprint(taskId: Task['id'], idempotencyKey: string): string | null | Promise<string | null>;
   save(session: AgentSession, expectedVersion: number): Promise<void>;
 }
 
 export interface SnapshotAgentSessionRepository extends AgentSessionRepository {
+  startFingerprint(taskId: Task['id'], idempotencyKey: string): string | null;
   snapshot(sessionId: AgentSessionId): AgentSession | null;
   restore(sessionId: AgentSessionId, session: AgentSession | null): void;
   bindIdempotency(taskId: Task['id'], key: string, sessionId: AgentSessionId): void;

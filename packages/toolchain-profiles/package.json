@@ -1,0 +1,11 @@
+{
+  "name": "@aicompany/toolchain-profiles",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": { ".": { "types": "./dist/index.d.ts", "import": "./dist/index.js" } },
+  "scripts": { "build": "tsc -b", "test": "vitest run --passWithNoTests --config vitest.config.ts", "typecheck": "tsc -b" },
+  "dependencies": { "@aicompany/execution-plane": "workspace:*" }
+}

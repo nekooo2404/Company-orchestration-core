@@ -227,7 +227,7 @@ export class InMemoryDispatchClaimStore implements DispatchClaimStore {
     return this.serialize(async () => {
     const workerId = canonicalId(input.workerId, 'workerId');
     const task = await this.tasks?.get(input.taskId);
-    if (this.tasks !== undefined && (task === null || task?.state !== 'READY' || task.version !== input.taskVersion || input.taskState !== 'READY')) return null;
+    if (this.tasks !== undefined && (task === null || task?.state !== 'READY' || task.version !== input.taskVersion || input.taskState !== 'READY' || (task.ownerAgentDefinitionId !== null && task.ownerAgentDefinitionId !== input.agentDefinitionId))) return null;
     const existing = this.claims.get(input.taskId);
     if (existing !== undefined && existing.taskVersion === input.taskVersion && (existing.expiresAt > input.now || existing.cleanupInProgress)) {
       return null;

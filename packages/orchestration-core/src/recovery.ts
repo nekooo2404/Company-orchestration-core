@@ -37,6 +37,7 @@ export interface RecoveryRequest {
   failure: FailureContext;
   actor: ActorRef;
   correlationId: CorrelationId;
+  fingerprintOverride?: string;
 }
 
 export interface RecoveryRecord {
@@ -160,7 +161,8 @@ export class RecoveryCoordinatorService implements RecoveryCoordinator, Recovery
       taskId,
       failure: derivedFailure,
       actor: event.actor,
-      correlationId: event.correlationId
+      correlationId: event.correlationId,
+      ...(event.eventType === 'TASK_FAILED' ? { fingerprintOverride: event.payload.failureFingerprint } : {})
     });
   }
 
@@ -171,7 +173,7 @@ export class RecoveryCoordinatorService implements RecoveryCoordinator, Recovery
       throw new Error('Recovery request task ID does not match failure task ID');
     }
     const task = await this.requireTask(taskId);
-    const fingerprint = failureFingerprint(input.failure);
+    const fingerprint = input.fingerprintOverride ?? failureFingerprint(input.failure);
     const currentRecoveryId = this.options.newRecoveryId?.(task.recoveryCycles, taskId) ?? `recovery:${taskId}:cycle:${task.recoveryCycles}`;
     const priorRecord = await this.options.records.get(currentRecoveryId);
     const startFingerprint = JSON.stringify({ taskId, fingerprint, attemptId: input.failure.attemptId,
@@ -250,6 +252,13 @@ export class RecoveryCoordinatorService implements RecoveryCoordinator, Recovery
       task: failed.task, expectedVersion: task.version, events: [failed.event], commands: [],
       record: { ...record, state: 'FAILED', evidenceIds, completionFingerprint },
       idempotencyKey: `recovery-complete:${record.recoveryId}`, requestFingerprint: completionFingerprint
+    });
+    await this.start({
+      taskId: failed.task.id,
+      failure: { taskId: failed.task.id, attemptId: `recovery:${record.recoveryId}`, errorClass: 'RecoveryAttemptFailed', commandName: 'RECOVERY', message: 'Recovery strategy failed', evidenceIds },
+      actor: SYSTEM_ACTOR,
+      correlationId: failed.task.traceId,
+      fingerprintOverride: record.fingerprint
     });
   }
 

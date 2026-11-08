@@ -1100,11 +1100,11 @@ export class PostgresStore implements EventStore, TransactionalPersistence {
     try {
       await client.query('BEGIN');
       await lockAggregate(client, `agent-capacity:${agentId}`);
-      const taskResult = await client.query<{ version: number; state: string }>(
-        'SELECT version, state FROM tasks WHERE task_id = $1 FOR UPDATE', [taskIdValue]
+      const taskResult = await client.query<{ version: number; state: string; owner_agent_definition_id: string | null }>(
+        'SELECT version, state, owner_agent_definition_id FROM tasks WHERE task_id = $1 FOR UPDATE', [taskIdValue]
       );
       const task = taskResult.rows[0];
-      if (task === undefined || task.version !== input.taskVersion || task.state !== 'READY') {
+      if (task === undefined || task.version !== input.taskVersion || task.state !== 'READY' || (task.owner_agent_definition_id !== null && task.owner_agent_definition_id !== agentId)) {
         await client.query('ROLLBACK');
         return null;
       }
@@ -1130,6 +1130,7 @@ export class PostgresStore implements EventStore, TransactionalPersistence {
        VALUES ($1, $2, $3, $4, 'READY', $5, $6, $7)
        ON CONFLICT (task_id) DO UPDATE SET worker_id = EXCLUDED.worker_id, expires_at = EXCLUDED.expires_at,
          task_version = EXCLUDED.task_version, task_state = EXCLUDED.task_state,
+         agent_definition_id = EXCLUDED.agent_definition_id,
          lease_id = CASE WHEN task_dispatch_claims.task_version = EXCLUDED.task_version
            THEN task_dispatch_claims.lease_id ELSE EXCLUDED.lease_id END,
          session_id = CASE WHEN task_dispatch_claims.task_version = EXCLUDED.task_version

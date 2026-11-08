@@ -82,7 +82,7 @@ export class AgentSessionManagerService implements AgentSessionManager {
     const prior = await this.options.sessionRepository.findByTask(input.taskId, input.idempotencyKey);
     if (prior) {
       const expectedFingerprint = this.startFingerprint(input);
-      if (this.options.sessionRepository.startFingerprint(input.taskId, input.idempotencyKey) !== expectedFingerprint) throw new Error('Start idempotency key was reused with different input');
+      if (await this.options.sessionRepository.startFingerprint(input.taskId, input.idempotencyKey) !== expectedFingerprint) throw new Error('Start idempotency key was reused with different input');
       return prior;
     }
     const task = await this.options.taskRepository.get(input.taskId);
@@ -90,7 +90,7 @@ export class AgentSessionManagerService implements AgentSessionManager {
     if (task.version !== input.expectedTaskVersion) throw new OptimisticConcurrencyError(task.id, input.expectedTaskVersion, task.version);
     if (!await this.options.workflowStatus.isActive(task.workflowId)) throw new Error('Workflow is not active');
     const claim = await this.options.dispatchClaims.getDispatchClaim(task.id);
-    if (!claim || claim.leaseId !== input.leaseId || claim.expiresAt.getTime() <= this.options.clock.now().getTime() || claim.taskVersion !== task.version || claim.agentDefinitionId !== input.agentDefinitionId) throw new Error('Current dispatch lease is missing, expired, stale, or does not match');
+    if (!claim || claim.leaseId !== input.leaseId || claim.expiresAt.getTime() <= this.options.clock.now().getTime() || claim.taskVersion !== task.version || claim.agentDefinitionId !== input.agentDefinitionId || claim.cleanupInProgress || (task.ownerAgentDefinitionId !== null && task.ownerAgentDefinitionId !== input.agentDefinitionId)) throw new Error('Current dispatch lease is missing, expired, stale, cleanup-fenced, or does not match task owner');
     if (task.state !== 'READY') throw new InvalidTaskTransitionError(task.id, task.state, 'TASK_STARTED');
     const now = this.options.clock.now();
     const sessionId = claim.sessionId;

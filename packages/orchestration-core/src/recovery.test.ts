@@ -188,8 +188,7 @@ describe('recovery coordinator', () => {
     await seed(task);
     const first = await coordinator.start(request('repeat-1', task));
     await coordinator.complete({ recoveryId: first.recoveryId, taskId: task.id, succeeded: false, evidenceIds: ['repair-failed'] });
-    const failed = (await tasks.get(task.id))!;
-    const second = await coordinator.start(request('repeat-1-next', failed));
+    const second = (await records.list(task.id)).at(-1)!;
 
     expect(second.fingerprint).toBe(first.fingerprint);
     expect(second.plan.strategyName).not.toBe(first.plan.strategyName);

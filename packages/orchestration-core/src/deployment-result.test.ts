@@ -35,4 +35,19 @@ describe('deployment result recorder', () => {
       approvalId: 'approval-1', attemptId: 'deploy:deployment-1:approval-1', evidenceIds: ['receipt-1']
     });
   });
+
+  it('persists failed deployment and starts recovery', async () => {
+    const tasks = new InMemoryTaskRepository();
+    const events = new InMemoryEventStore();
+    const outbox = new InMemoryOutbox();
+    await tasks.save(deployment, 0);
+    const persistence = new InMemoryApprovalTransactionalPersistence({ tasks, events, outbox,
+      approvals: new InMemoryApprovalStore() });
+    let started = 0;
+    const recorder = new DeploymentResultRecorder({ tasks, persistence,
+      verifier: { async verify() { return { approvalId: approvalId('approval-1'), attemptId: deployment.deploymentAttemptId!, succeeded: false, evidenceIds: ['failed-receipt'] }; } },
+      recoveryCoordinator: { async start() { started += 1; return {} as never; } }, now: () => now });
+    await expect(recorder.record(deployment.id)).resolves.toMatchObject({ state: 'FAILED' });
+    expect(started).toBe(1);
+  });
 });

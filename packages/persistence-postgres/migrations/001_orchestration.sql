@@ -79,8 +79,56 @@ CREATE TABLE IF NOT EXISTS agent_sessions (
   tool_call_history jsonb NOT NULL,
   attempt integer,
   version integer NOT NULL DEFAULT 0,
+  start_idempotency_key text,
+  start_fingerprint text,
   created_at timestamptz NOT NULL,
   updated_at timestamptz NOT NULL
+);
+
+ALTER TABLE agent_sessions ADD COLUMN IF NOT EXISTS start_idempotency_key text;
+ALTER TABLE agent_sessions ADD COLUMN IF NOT EXISTS start_fingerprint text;
+CREATE UNIQUE INDEX IF NOT EXISTS agent_sessions_start_idempotency_key
+  ON agent_sessions (task_id, start_idempotency_key)
+  WHERE start_idempotency_key IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS agent_checkpoints (
+  session_id text NOT NULL REFERENCES agent_sessions(session_id) ON DELETE CASCADE,
+  sequence integer NOT NULL CHECK (sequence > 0),
+  task_id text NOT NULL REFERENCES tasks(task_id) ON DELETE CASCADE,
+  state text NOT NULL,
+  context_reference text NOT NULL,
+  last_event_id text NOT NULL,
+  completed_operation_keys jsonb NOT NULL,
+  created_at timestamptz NOT NULL,
+  PRIMARY KEY (session_id, sequence)
+);
+
+CREATE TABLE IF NOT EXISTS messages (
+  message_id text PRIMARY KEY,
+  idempotency_key text NOT NULL UNIQUE,
+  actor jsonb NOT NULL,
+  scope jsonb NOT NULL,
+  message_type text NOT NULL,
+  content_reference text NOT NULL,
+  correlation_id text NOT NULL,
+  causation_id text NOT NULL,
+  created_at timestamptz NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS usage_records (
+  usage_id text PRIMARY KEY,
+  workflow_id text NOT NULL,
+  task_id text NOT NULL,
+  agent_session_id text NOT NULL,
+  agent_definition_id text NOT NULL,
+  department text NOT NULL,
+  provider text NOT NULL,
+  base_url_identifier text NOT NULL,
+  model text NOT NULL,
+  input_tokens integer NOT NULL CHECK (input_tokens >= 0),
+  output_tokens integer NOT NULL CHECK (output_tokens >= 0),
+  estimated_cost_usd double precision NOT NULL CHECK (estimated_cost_usd >= 0),
+  created_at timestamptz NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS task_dispatch_claims (

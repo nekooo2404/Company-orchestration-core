@@ -4,6 +4,12 @@
     { "path": "./packages/contracts" },
     { "path": "./packages/orchestration-core" },
     { "path": "./packages/orchestration-harness" },
-    { "path": "./packages/persistence-postgres" }
+    { "path": "./packages/persistence-postgres" },
+    { "path": "./packages/execution-plane" },
+    { "path": "./packages/model-gateway" },
+    { "path": "./packages/source-deployment" },
+    { "path": "./packages/memory-knowledge" },
+    { "path": "./packages/toolchain-profiles" },
+    { "path": "./packages/control-plane" }
   ]
 }

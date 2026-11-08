@@ -15,7 +15,9 @@
     "build": "tsc -b",
     "test": "vitest run --passWithNoTests --config vitest.config.ts",
     "typecheck": "tsc -b",
-    "test:node-import": "node scripts/smoke-built-packages.mjs"
+    "test:node-import": "pnpm build && node scripts/smoke-built-packages.mjs",
+    "db:backup": "node scripts/backup.mjs",
+    "db:restore": "node scripts/restore.mjs"
   },
   "dependencies": {
     "@aicompany/contracts": "workspace:*",

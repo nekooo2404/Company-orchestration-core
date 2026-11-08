@@ -390,7 +390,9 @@ export async function runRecoveryScenario(): Promise<RecoveryScenarioResult> {
   ]);
   const recoveryFor = async (task: Task, cycle: number) => {
     let current = (await harness.tasks.get(task.id))!;
-    if (current.state !== 'FAILED') {
+    const existingRecord = (await harness.recoveryRecords.list(task.id)).at(-1);
+    const hasActiveCycle = existingRecord?.state === 'STARTED' && existingRecord.cycle === cycle;
+    if (!hasActiveCycle && current.state !== 'FAILED' && current.state !== 'RECOVERING') {
       if (current.state === 'PENDING') {
         const readyTask = transitionTask(current, { type: 'TASK_READY' }, { actor, now: harness.clock.now(), evidenceIds: [], isDeployment: false });
         await harness.persistence.saveTaskAndAppend({ task: readyTask.task, expectedVersion: current.version, events: [readyTask.event], commands: [] });
@@ -404,7 +406,9 @@ export async function runRecoveryScenario(): Promise<RecoveryScenarioResult> {
       const failed = transitionTask(current, { type: 'TASK_FAILED', failureFingerprint: `fingerprint:${task.id}` }, { actor, now: harness.clock.now(), evidenceIds: [], isDeployment: false });
       await harness.persistence.saveTaskAndAppend({ task: failed.task, expectedVersion: current.version, events: [failed.event], commands: [] });
     }
-    const record = await harness.recovery.start({ taskId: task.id, failure: { taskId: task.id, attemptId: `attempt:${cycle}`, errorClass: 'SimulatedFailure', commandName: 'fake.execute', message: 'deterministic failure', evidenceIds: [] }, actor, correlationId: task.traceId });
+    const record = hasActiveCycle && existingRecord
+      ? existingRecord
+      : await harness.recovery.start({ taskId: task.id, failure: { taskId: task.id, attemptId: `attempt:${cycle}`, errorClass: 'SimulatedFailure', commandName: 'fake.execute', message: 'deterministic failure', evidenceIds: [] }, actor, correlationId: task.traceId });
     if (record.cycle !== cycle) throw new Error('Recovery cycle sequence diverged');
     const environment = recoveryEnvironments.get(task.id);
     if (environment === undefined) throw new Error(`Missing simulated recovery environment for ${task.id}`);
