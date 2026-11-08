@@ -26,6 +26,7 @@ import {
   transitionTask
 } from '@aicompany/orchestration-core';
 import { SimulatedAgent } from './simulated-agent';
+import type { SimulatedAgentResult } from './simulated-agent';
 
 const fixedTime = new Date('2026-11-08T00:00:00.000Z');
 const departments = ['Product', 'Architecture', 'Development', 'Review', 'QA', 'Security', 'DevOps'] as const;
@@ -44,6 +45,15 @@ export interface ScenarioResult {
   mergeEvidenceCount: number;
   usageRecordCount: number;
   deployCommandCount: number;
+  deploymentTaskState: Task['state'];
+  agentEvidence: {
+    progressCount: number;
+    artifactIds: string[];
+    reviewRequestCount: number;
+    testRequestCount: number;
+    checkpointIds: string[];
+    evidenceIds: string[];
+  };
 }
 
 export interface RecoveryScenarioResult {
@@ -53,7 +63,15 @@ export interface RecoveryScenarioResult {
   escalatedTaskCount: number;
   independentBranchState: Task['state'];
   dependentBranchState: Task['state'];
-  strategyNames: string[];
+  recoveryAttempts: Array<{
+    taskId: TaskId;
+    cycle: number;
+    fingerprint: string;
+    selectedStrategyName: string;
+    usedStrategyName: string;
+    state: string;
+  }>;
+  successfulStrategyName: string;
 }
 
 interface Harness {
@@ -117,6 +135,11 @@ const saveTransition = async (harness: Harness, task: Task, type: 'TASK_COMPLETE
   return result.task;
 };
 
+const executeRecoveryPlan = (plan: { strategyName: string }, outcome: 'FAIL' | 'SUCCEED') => ({
+  appliedStrategyName: plan.strategyName,
+  outcome
+});
+
 const createScheduler = (harness: Harness, agent: SimulatedAgent): SchedulerService => {
   const definitions = departments.map((department) => ({
     id: agentDefinitionId(`agent:${department.toLowerCase()}`),
@@ -143,6 +166,12 @@ export async function runFiftyAgentScenario(): Promise<ScenarioResult> {
   const trace = new InMemoryTraceSink(harness.clock.now);
   const metrics = new InMemoryMetricsSink();
   const costs = new InMemoryCostSink();
+  const evidenceCollection: SimulatedAgentResult[] = [];
+  const execute = (task: Task, department: string): SimulatedAgentResult => {
+    const result = agent.execute(task, department);
+    evidenceCollection.push(structuredClone(result));
+    return result;
+  };
   const generated = Array.from({ length: 60 }, (_, index) => makeTask(taskId(`scenario-task-${String(index + 1).padStart(2, '0')}`), workflow, index, index === 59));
   for (const task of generated) await harness.tasks.save(task, 0);
 
@@ -154,7 +183,7 @@ export async function runFiftyAgentScenario(): Promise<ScenarioResult> {
     if (task === null) throw new Error('Dispatched task disappeared');
     if (task.isDeployment) continue;
     const span = trace.startSpan({ name: 'simulated-agent-task', workflowId: workflow, taskId: task.id, correlationId: task.traceId, attributes: { department: task.title?.split(' ')[0] ?? 'unknown' } });
-    const result = agent.execute(task, task.title?.split(' ')[0] ?? 'Development');
+    const result = execute(task, task.title?.split(' ')[0] ?? 'Development');
     const started = transitionTask(task, { type: 'TASK_REVIEW_REQUESTED' }, { actor, now: harness.clock.now(), evidenceIds: result.evidenceIds, isDeployment: false });
     await harness.persistence.saveTaskAndAppend({ task: started.task, expectedVersion: task.version, events: [started.event], commands: [] });
     const review = transitionTask(started.task, { type: 'TASK_COMPLETED', evidenceIds: result.evidenceIds }, { actor, now: harness.clock.now(), evidenceIds: result.evidenceIds, isDeployment: false });
@@ -172,7 +201,7 @@ export async function runFiftyAgentScenario(): Promise<ScenarioResult> {
   for (const decision of second) {
     if (decision.taskId === deploymentDecision.taskId) continue;
     const task = (await harness.tasks.get(decision.taskId))!;
-    const result = agent.execute(task, task.title?.split(' ')[0] ?? 'Development');
+    const result = execute(task, task.title?.split(' ')[0] ?? 'Development');
     const review = transitionTask(task, { type: 'TASK_REVIEW_REQUESTED' }, { actor, now: harness.clock.now(), evidenceIds: result.evidenceIds, isDeployment: false });
     await harness.persistence.saveTaskAndAppend({ task: review.task, expectedVersion: task.version, events: [review.event], commands: [] });
     const complete = transitionTask(review.task, { type: 'TASK_COMPLETED', evidenceIds: result.evidenceIds }, { actor, now: harness.clock.now(), evidenceIds: result.evidenceIds, isDeployment: false });
@@ -182,7 +211,7 @@ export async function runFiftyAgentScenario(): Promise<ScenarioResult> {
   }
   const deploymentTask = await harness.tasks.get(deploymentDecision.taskId);
   if (deploymentTask === null) throw new Error('Deployment task disappeared');
-  const deploymentResult = agent.execute(deploymentTask, 'DevOps');
+  const deploymentResult = execute(deploymentTask, 'DevOps');
   await costs.recordUsage({ usageId: `usage:${deploymentTask.id}`, workflowId: workflow, taskId: deploymentTask.id, agentSessionId: agent.sessionIdFor(deploymentTask), agentDefinitionId: agentDefinitionId('agent:devops'), department: 'DevOps', provider: 'fake', baseUrlIdentifier: 'in-memory', model: 'simulated-deterministic', inputTokens: 100, outputTokens: 50, estimatedCostUsd: 0.001, createdAt: harness.clock.now() });
   const reviewTask = transitionTask(deploymentTask, { type: 'TASK_REVIEW_REQUESTED' }, { actor, now: harness.clock.now(), evidenceIds: deploymentResult.evidenceIds, isDeployment: true });
   await harness.persistence.saveTaskAndAppend({ task: reviewTask.task, expectedVersion: deploymentTask.version, events: [reviewTask.event], commands: [] });
@@ -215,7 +244,8 @@ export async function runFiftyAgentScenario(): Promise<ScenarioResult> {
   const deployCommands = await harness.outbox.claim(1000, 'deploy-command-audit');
   const deploymentCompletedAfterApproval = approved.state === 'APPROVED' && (await harness.tasks.get(waiting.id))?.state === 'RUNNING';
   const deployed = await saveTransition(harness, (await harness.tasks.get(waiting.id))!, 'DEPLOYMENT_RESULT_RECORDED', [`deployment:${waiting.id}:verified`]);
-  void deployed;
+  const storedDeployment = await harness.tasks.get(deployed.id);
+  if (storedDeployment?.state !== 'COMPLETED') throw new Error('Persisted deployment task did not complete after verified deployment');
   const finalTasks = await harness.tasks.listByWorkflow(workflow);
   const cost = await costs.getWorkflowCost(workflow);
   metrics.observe('simulated.workflow.cost', cost.estimatedCostUsd, { workflow: workflow });
@@ -231,7 +261,16 @@ export async function runFiftyAgentScenario(): Promise<ScenarioResult> {
     deploymentCompletedAfterApproval,
     mergeEvidenceCount: agent.artifacts.filter(({ department }) => department === 'Review').length,
     usageRecordCount: costs.usages.length,
-    deployCommandCount: deployCommands.filter(({ type }) => type === 'DEPLOY').length
+    deployCommandCount: deployCommands.filter(({ type }) => type === 'DEPLOY').length,
+    deploymentTaskState: storedDeployment.state,
+    agentEvidence: {
+      progressCount: evidenceCollection.reduce((sum, evidence) => sum + evidence.progress.length, 0),
+      artifactIds: evidenceCollection.map(({ artifact }) => artifact.artifactId).sort(),
+      reviewRequestCount: evidenceCollection.filter(({ requestedChecks }) => requestedChecks.includes('review')).length,
+      testRequestCount: evidenceCollection.filter(({ requestedChecks }) => requestedChecks.includes('test')).length,
+      checkpointIds: evidenceCollection.map(({ checkpoint }) => checkpoint).sort(),
+      evidenceIds: evidenceCollection.flatMap(({ evidenceIds: ids }) => ids).sort()
+    }
   };
 }
 
@@ -243,6 +282,7 @@ export async function runRecoveryScenario(): Promise<RecoveryScenarioResult> {
   const independent = makeTask(taskId('recovery-independent'), workflow, 3);
   const dependent = { ...makeTask(taskId('recovery-dependent'), workflow, 4), dependencyIds: [escalated.id] };
   for (const task of [retry, escalated, independent, dependent]) await harness.tasks.save(task, 0);
+  const recoveryAttempts: RecoveryScenarioResult['recoveryAttempts'] = [];
   const recoveryFor = async (task: Task, cycle: number, succeeds: boolean) => {
     let current = (await harness.tasks.get(task.id))!;
     if (current.state !== 'FAILED') {
@@ -261,14 +301,23 @@ export async function runRecoveryScenario(): Promise<RecoveryScenarioResult> {
     }
     const record = await harness.recovery.start({ taskId: task.id, failure: { taskId: task.id, attemptId: `attempt:${cycle}`, errorClass: 'SimulatedFailure', commandName: 'fake.execute', message: 'deterministic failure', evidenceIds: [] }, actor, correlationId: task.traceId });
     if (record.cycle !== cycle) throw new Error('Recovery cycle sequence diverged');
-    await harness.recovery.complete({ recoveryId: record.recoveryId, taskId: task.id, succeeded: succeeds, evidenceIds: [`recovery-evidence:${task.id}:${cycle}`] });
-    if (cycle === 5) return 'ESCALATED';
-    return record.plan.strategyName;
+    const simulatedExecution = executeRecoveryPlan(record.plan, succeeds ? 'SUCCEED' : 'FAIL');
+    await harness.recovery.complete({ recoveryId: record.recoveryId, taskId: task.id, succeeded: simulatedExecution.outcome === 'SUCCEED', evidenceIds: [`recovery-evidence:${task.id}:${cycle}`] });
+    const completedRecord = await harness.recoveryRecords.get(record.recoveryId);
+    if (completedRecord === null) throw new Error('Recovery record was not persisted');
+    recoveryAttempts.push({
+      taskId: task.id,
+      cycle,
+      fingerprint: completedRecord.fingerprint,
+      selectedStrategyName: record.plan.strategyName,
+      usedStrategyName: simulatedExecution.appliedStrategyName,
+      state: completedRecord.state
+    });
+    return recoveryAttempts.at(-1)!;
   };
-  const strategyNames: string[] = [];
-  strategyNames.push(await recoveryFor(retry, 1, false) as string);
-  strategyNames.push(await recoveryFor(retry, 2, false) as string);
-  await recoveryFor(retry, 3, true);
+  await recoveryFor(retry, 1, false);
+  await recoveryFor(retry, 2, false);
+  const successfulAttempt = await recoveryFor(retry, 3, true);
   for (let cycle = 1; cycle <= 5; cycle += 1) await recoveryFor(escalated, cycle, false);
   const ready = transitionTask((await harness.tasks.get(independent.id))!, { type: 'TASK_READY' }, { actor, now: harness.clock.now(), evidenceIds: [], isDeployment: false });
   await harness.persistence.saveTaskAndAppend({ task: ready.task, expectedVersion: ready.task.version - 1, events: [ready.event], commands: [] });
@@ -286,7 +335,8 @@ export async function runRecoveryScenario(): Promise<RecoveryScenarioResult> {
     escalatedTaskCount: taskList.filter(({ state }) => state === 'ESCALATED_TO_CEO').length,
     independentBranchState: taskList.find(({ id }) => id === independent.id)!.state,
     dependentBranchState: taskList.find(({ id }) => id === dependent.id)!.state,
-    strategyNames
+    recoveryAttempts,
+    successfulStrategyName: successfulAttempt.usedStrategyName
   };
 }
 
