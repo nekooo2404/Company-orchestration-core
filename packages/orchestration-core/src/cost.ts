@@ -52,6 +52,7 @@ export interface BudgetCheckInput {
   taskBudget: CostBudget;
   agentBudget: CostBudget;
   workflowBudget: CostBudget;
+  projectedScope: CostScope;
   projectedInputTokens: number;
   projectedOutputTokens: number;
   projectedCostUsd: number;
@@ -125,6 +126,13 @@ const validateProjectedUsage = (input: BudgetCheckInput): void => {
   }
 };
 
+const validateProjectedScope = (scope: CostScope): CostScope => {
+  if (scope !== 'task' && scope !== 'agent' && scope !== 'workflow') {
+    throw new RangeError(`projectedScope must be task, agent, or workflow`);
+  }
+  return scope;
+};
+
 const add = (summary: CostSummary, record: UsageRecord): void => {
   summary.inputTokens += record.inputTokens;
   summary.outputTokens += record.outputTokens;
@@ -191,6 +199,7 @@ export class InMemoryCostUsage {
     const workflowId = WorkflowIdSchema.parse(input.workflowId);
     const agentDefinitionId = AgentDefinitionIdSchema.parse(input.agentDefinitionId);
     const department = text(input.department, 'department');
+    const projectedScope = validateProjectedScope(input.projectedScope);
     validateBudget(input.taskBudget, 'task');
     validateBudget(input.agentBudget, 'agent');
     validateBudget(input.workflowBudget, 'workflow');
@@ -205,8 +214,12 @@ export class InMemoryCostUsage {
     for (const [scope, scopeRecords, budget] of [
       ['task', taskRecords, input.taskBudget], ['agent', agentRecords, input.agentBudget], ['workflow', workflowRecords, input.workflowBudget]
     ] as const) {
-      const tokens = scopeRecords.reduce((sum, record) => sum + record.inputTokens + record.outputTokens, input.projectedInputTokens + input.projectedOutputTokens);
-      const cost = scopeRecords.reduce((sum, record) => sum + record.estimatedCostUsd, input.projectedCostUsd);
+      const projectedTokens = scope === projectedScope
+        ? input.projectedInputTokens + input.projectedOutputTokens
+        : 0;
+      const projectedCost = scope === projectedScope ? input.projectedCostUsd : 0;
+      const tokens = scopeRecords.reduce((sum, record) => sum + record.inputTokens + record.outputTokens, projectedTokens);
+      const cost = scopeRecords.reduce((sum, record) => sum + record.estimatedCostUsd, projectedCost);
       if (tokens > budget.maxTokens || cost > budget.maxCostUsd) {
         return {
           kind: 'exceeded', scope, workflowId, taskId, branchTaskId,

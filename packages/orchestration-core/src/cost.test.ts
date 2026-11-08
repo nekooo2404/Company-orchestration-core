@@ -21,6 +21,7 @@ const budgetInput = (overrides: Partial<BudgetCheckInput> = {}): BudgetCheckInpu
   agentDefinitionId: agentDefinitionId('agent-1'), department: 'engineering',
   taskBudget: { maxTokens: 100, maxCostUsd: 10 }, agentBudget: { maxTokens: 100, maxCostUsd: 10 },
   workflowBudget: { maxTokens: 100, maxCostUsd: 10 },
+  projectedScope: 'task',
   projectedInputTokens: 0, projectedOutputTokens: 0, projectedCostUsd: 0,
   ...overrides
 });
@@ -104,6 +105,30 @@ describe('cost accounting', () => {
       projectedInputTokens: 1, projectedOutputTokens: 1, projectedCostUsd: 0.16
     }));
     expect(decision).toMatchObject({ kind: 'exceeded', scope: 'task', branchTaskId: 'branch-root' });
+  });
+
+  it('charges task projections to the task budget without falsely charging an unrelated agent budget', async () => {
+    const usageStore = new InMemoryCostUsage();
+    const projection = budgetInput({
+      projectedScope: 'task', projectedInputTokens: 6, projectedOutputTokens: 0, projectedCostUsd: 0.6,
+      taskBudget: { maxTokens: 5, maxCostUsd: 0.5 }, agentBudget: { maxTokens: 0, maxCostUsd: 0 },
+      workflowBudget: { maxTokens: 100, maxCostUsd: 10 }
+    });
+    expect(await usageStore.checkBudget(projection)).toMatchObject({ kind: 'exceeded', scope: 'task' });
+    expect(await usageStore.checkBudget({
+      ...projection,
+      taskBudget: { maxTokens: 100, maxCostUsd: 10 }
+    })).toEqual({ kind: 'allowed' });
+  });
+
+  it('charges a workflow projection to the workflow budget', async () => {
+    const usageStore = new InMemoryCostUsage();
+    const projection = budgetInput({
+      projectedScope: 'workflow', projectedInputTokens: 6, projectedOutputTokens: 0, projectedCostUsd: 0.6,
+      taskBudget: { maxTokens: 100, maxCostUsd: 10 }, agentBudget: { maxTokens: 100, maxCostUsd: 10 },
+      workflowBudget: { maxTokens: 5, maxCostUsd: 0.5 }
+    });
+    expect(await usageStore.checkBudget(projection)).toMatchObject({ kind: 'exceeded', scope: 'workflow' });
   });
 
   it('checks agent and workflow limits and reports the narrowest exceeded scope', async () => {
