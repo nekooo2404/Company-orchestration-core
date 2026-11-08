@@ -1,11 +1,13 @@
 import { describe, expect, it } from 'vitest';
-import { correlationId, taskId, workflowId } from '@aicompany/contracts';
+import { agentSessionId, correlationId, eventId, taskId, workflowId } from '@aicompany/contracts';
 import {
+  type TraceContext,
   InMemoryMetricsSink,
   InMemoryTraceSink,
   NoopMetricsSink,
   NoopTraceSink,
-  recordMetric
+  recordMetric,
+  startSpanWithContext
 } from './observability';
 
 describe('observability ports', () => {
@@ -13,7 +15,7 @@ describe('observability ports', () => {
     const sink = new InMemoryTraceSink();
     const span = sink.startSpan({
       name: 'tool.invoke', workflowId: workflowId('workflow-1'), taskId: taskId('task-1'),
-      sessionId: 'session-1' as never, correlationId: correlationId('trace-1'),
+      sessionId: agentSessionId('session-1'), correlationId: correlationId('trace-1'),
       attributes: { operation: 'read' }
     });
     span.end({ result: 'ok' });
@@ -32,6 +34,32 @@ describe('observability ports', () => {
     span.end();
     expect(sink.spans).toHaveLength(1);
     expect(sink.spans[0]).toMatchObject({ status: 'failed', error: { name: 'Error', message: 'provider unavailable' } });
+  });
+
+  it('redacts bearer and quoted secrets before storing a span error', () => {
+    const sink = new InMemoryTraceSink();
+    const span = sink.startSpan({ name: 'provider.call', workflowId: workflowId('w'),
+      correlationId: correlationId('c'), attributes: {} });
+    span.fail(new Error('Authorization: Bearer bearer-secret password="json-secret" api_key=plain-secret private_key: \'pem-secret\''));
+    const message = sink.spans[0].error?.message ?? '';
+    expect(message).toContain('Bearer <redacted>');
+    expect(message).not.toMatch(/bearer-secret|json-secret|plain-secret|pem-secret/);
+  });
+
+  it('propagates shared IDs through command, session, tool, recovery and approval spans', () => {
+    const sink = new InMemoryTraceSink();
+    const context: TraceContext = {
+      workflowId: workflowId('workflow-1'), taskId: taskId('task-1'),
+      sessionId: agentSessionId('session-1'), correlationId: correlationId('trace-1'),
+      causationId: eventId('cause-1')
+    };
+    for (const name of ['command.execute', 'session.run', 'tool.invoke', 'recovery.start', 'approval.request']) {
+      startSpanWithContext(sink, context, name, { context: name }).end();
+    }
+    expect(sink.spans).toHaveLength(5);
+    for (const span of sink.spans) {
+      expect(span).toMatchObject({ workflowId: 'workflow-1', taskId: 'task-1', sessionId: 'session-1', correlationId: 'trace-1', causationId: 'cause-1' });
+    }
   });
 
   it('provides no-op ports and prevents metrics errors from escaping', () => {

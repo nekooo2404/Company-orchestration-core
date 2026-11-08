@@ -46,11 +46,15 @@ export interface CostBudget { maxTokens: number; maxCostUsd: number }
 export interface BudgetCheckInput {
   workflowId: WorkflowId;
   taskId: TaskId;
+  branchTaskId: TaskId;
   agentDefinitionId: AgentDefinitionId;
   department: string;
   taskBudget: CostBudget;
   agentBudget: CostBudget;
   workflowBudget: CostBudget;
+  projectedInputTokens: number;
+  projectedOutputTokens: number;
+  projectedCostUsd: number;
 }
 
 export type BudgetDecision =
@@ -63,7 +67,7 @@ export type BudgetDecision =
     branchTaskId: TaskId;
     decision: 'PAUSE_BRANCH';
     reason: string;
-    escalation: { type: 'COST_BUDGET_EXCEEDED'; scope: CostScope; workflowId: WorkflowId; taskId: TaskId; agentDefinitionId: AgentDefinitionId };
+    escalation: { type: 'COST_BUDGET_EXCEEDED'; scope: CostScope; workflowId: WorkflowId; taskId: TaskId; branchTaskId: TaskId; agentDefinitionId: AgentDefinitionId };
   };
 
 const text = (value: string, label: string): string => {
@@ -110,6 +114,17 @@ const validateBudget = (budget: CostBudget, scope: CostScope): void => {
   }
 };
 
+const validateProjectedUsage = (input: BudgetCheckInput): void => {
+  for (const field of ['projectedInputTokens', 'projectedOutputTokens'] as const) {
+    if (!Number.isSafeInteger(input[field]) || input[field] < 0) {
+      throw new RangeError(`${field} must be a non-negative safe integer`);
+    }
+  }
+  if (!Number.isFinite(input.projectedCostUsd) || input.projectedCostUsd < 0) {
+    throw new RangeError('projectedCostUsd must be finite and non-negative');
+  }
+};
+
 const add = (summary: CostSummary, record: UsageRecord): void => {
   summary.inputTokens += record.inputTokens;
   summary.outputTokens += record.outputTokens;
@@ -129,10 +144,17 @@ const cloneSummary = (summary: CostSummary): CostSummary => ({
   ...summary, byModel: { ...summary.byModel }, byDepartment: { ...summary.byDepartment }, byAgent: { ...summary.byAgent }
 });
 
+const usageIdOrder = (left: UsageRecord, right: UsageRecord): number =>
+  left.usageId < right.usageId ? -1 : left.usageId > right.usageId ? 1 : 0;
+
 export class InMemoryCostSink implements CostSink {
   private readonly records = new Map<string, UsageRecord>();
 
-  public get usages(): UsageRecord[] { return [...this.records.values()].map(cloneUsage); }
+  public get usages(): UsageRecord[] { return this.orderedUsages().map(cloneUsage); }
+
+  private orderedUsages(): UsageRecord[] {
+    return [...this.records.values()].sort(usageIdOrder);
+  }
 
   public async recordUsage(input: UsageRecord): Promise<void> {
     const record = validateUsage(input);
@@ -147,13 +169,13 @@ export class InMemoryCostSink implements CostSink {
   public async getWorkflowCost(workflowId: WorkflowId): Promise<CostSummary> {
     const normalized = WorkflowIdSchema.parse(workflowId);
     const summary = emptySummary(normalized);
-    for (const record of this.records.values()) if (record.workflowId === normalized) add(summary, record);
+    for (const record of this.orderedUsages()) if (record.workflowId === normalized) add(summary, record);
     return cloneSummary(summary);
   }
 
   public async getAggregateCost(): Promise<CostSummary> {
     const summary = emptySummary();
-    for (const record of this.records.values()) add(summary, record);
+    for (const record of this.orderedUsages()) add(summary, record);
     return cloneSummary(summary);
   }
 }
@@ -165,27 +187,32 @@ export class InMemoryCostUsage {
 
   public async checkBudget(input: BudgetCheckInput): Promise<BudgetDecision> {
     const taskId = TaskIdSchema.parse(input.taskId);
+    const branchTaskId = TaskIdSchema.parse(input.branchTaskId);
     const workflowId = WorkflowIdSchema.parse(input.workflowId);
     const agentDefinitionId = AgentDefinitionIdSchema.parse(input.agentDefinitionId);
+    const department = text(input.department, 'department');
     validateBudget(input.taskBudget, 'task');
     validateBudget(input.agentBudget, 'agent');
     validateBudget(input.workflowBudget, 'workflow');
+    validateProjectedUsage(input);
     const records = this.sink.usages;
     const relevant = (record: UsageRecord): boolean => record.workflowId === workflowId;
     const taskRecords = records.filter((record) => relevant(record) && record.taskId === taskId);
-    const agentRecords = records.filter((record) => relevant(record) && record.agentDefinitionId === agentDefinitionId);
+    const agentRecords = records.filter((record) =>
+      relevant(record) && record.agentDefinitionId === agentDefinitionId && record.department === department
+    );
     const workflowRecords = records.filter(relevant);
     for (const [scope, scopeRecords, budget] of [
       ['task', taskRecords, input.taskBudget], ['agent', agentRecords, input.agentBudget], ['workflow', workflowRecords, input.workflowBudget]
     ] as const) {
-      const tokens = scopeRecords.reduce((sum, record) => sum + record.inputTokens + record.outputTokens, 0);
-      const cost = scopeRecords.reduce((sum, record) => sum + record.estimatedCostUsd, 0);
+      const tokens = scopeRecords.reduce((sum, record) => sum + record.inputTokens + record.outputTokens, input.projectedInputTokens + input.projectedOutputTokens);
+      const cost = scopeRecords.reduce((sum, record) => sum + record.estimatedCostUsd, input.projectedCostUsd);
       if (tokens > budget.maxTokens || cost > budget.maxCostUsd) {
         return {
-          kind: 'exceeded', scope, workflowId, taskId, branchTaskId: taskId,
+          kind: 'exceeded', scope, workflowId, taskId, branchTaskId,
           decision: 'PAUSE_BRANCH',
           reason: `${scope} budget exceeded (${tokens}/${budget.maxTokens} tokens, $${cost}/${budget.maxCostUsd})`,
-          escalation: { type: 'COST_BUDGET_EXCEEDED', scope, workflowId, taskId, agentDefinitionId }
+          escalation: { type: 'COST_BUDGET_EXCEEDED', scope, workflowId, taskId, branchTaskId, agentDefinitionId }
         };
       }
     }

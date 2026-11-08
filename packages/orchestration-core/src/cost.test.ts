@@ -16,6 +16,15 @@ const usage = (overrides: Partial<UsageRecord> = {}): UsageRecord => ({
   ...overrides
 });
 
+const budgetInput = (overrides: Partial<BudgetCheckInput> = {}): BudgetCheckInput => ({
+  workflowId: workflowId('workflow-1'), taskId: taskId('task-1'), branchTaskId: taskId('branch-root'),
+  agentDefinitionId: agentDefinitionId('agent-1'), department: 'engineering',
+  taskBudget: { maxTokens: 100, maxCostUsd: 10 }, agentBudget: { maxTokens: 100, maxCostUsd: 10 },
+  workflowBudget: { maxTokens: 100, maxCostUsd: 10 },
+  projectedInputTokens: 0, projectedOutputTokens: 0, projectedCostUsd: 0,
+  ...overrides
+});
+
 describe('cost accounting', () => {
   it('records token, model, provider, endpoint, task, agent and department usage', async () => {
     const sink = new InMemoryCostSink();
@@ -57,45 +66,68 @@ describe('cost accounting', () => {
     expect(await sink.getAggregateCost()).toMatchObject({ estimatedCostUsd: 1, byDepartment: { engineering: 0.25, design: 0.75 }, byAgent: { 'agent-1': 0.25, 'agent-2': 0.75 } });
   });
 
+  it('produces the same totals regardless of usage insertion order', async () => {
+    const records = [
+      usage({ usageId: 'usage-1', estimatedCostUsd: 0.1 }),
+      usage({ usageId: 'usage-2', estimatedCostUsd: 0.2 }),
+      usage({ usageId: 'usage-3', estimatedCostUsd: 0.3 })
+    ];
+    const first = new InMemoryCostSink();
+    const second = new InMemoryCostSink();
+    for (const record of [...records].reverse()) await first.recordUsage(record);
+    for (const record of records) await second.recordUsage(record);
+    expect(await first.getAggregateCost()).toEqual(await second.getAggregateCost());
+  });
+
   it('allows usage exactly at a budget and pauses only the exceeded branch with escalation details', async () => {
     const usageStore = new InMemoryCostUsage();
-    const input: BudgetCheckInput = {
-      workflowId: workflowId('workflow-1'), taskId: taskId('task-1'),
-      agentDefinitionId: agentDefinitionId('agent-1'), department: 'engineering',
+    const input = budgetInput({
       taskBudget: { maxTokens: 15, maxCostUsd: 0.25 }, agentBudget: { maxTokens: 15, maxCostUsd: 0.25 },
       workflowBudget: { maxTokens: 15, maxCostUsd: 0.25 }
-    };
+    });
     await usageStore.recordUsage(usage());
     expect(await usageStore.checkBudget(input)).toEqual({ kind: 'allowed' });
     const blocked = await usageStore.checkBudget({ ...input,
       taskBudget: { maxTokens: 15, maxCostUsd: 0.2 } });
-    expect(blocked).toMatchObject({ kind: 'exceeded', scope: 'task', branchTaskId: 'task-1',
-      decision: 'PAUSE_BRANCH', escalation: { workflowId: 'workflow-1', taskId: 'task-1' } });
+    expect(blocked).toMatchObject({ kind: 'exceeded', scope: 'task', branchTaskId: 'branch-root',
+      decision: 'PAUSE_BRANCH', escalation: { workflowId: 'workflow-1', taskId: 'task-1', branchTaskId: 'branch-root' } });
     expect(() => new BudgetExceededError(blocked as Extract<typeof blocked, { kind: 'exceeded' }>)).not.toThrow();
+    expect(await usageStore.checkBudget(input)).toEqual({ kind: 'allowed' });
+  });
+
+  it('checks accumulated plus projected usage before dispatch', async () => {
+    const usageStore = new InMemoryCostUsage();
+    await usageStore.recordUsage(usage());
+    const decision = await usageStore.checkBudget(budgetInput({
+      taskBudget: { maxTokens: 16, maxCostUsd: 0.4 }, agentBudget: { maxTokens: 100, maxCostUsd: 10 },
+      workflowBudget: { maxTokens: 100, maxCostUsd: 10 },
+      projectedInputTokens: 1, projectedOutputTokens: 1, projectedCostUsd: 0.16
+    }));
+    expect(decision).toMatchObject({ kind: 'exceeded', scope: 'task', branchTaskId: 'branch-root' });
   });
 
   it('checks agent and workflow limits and reports the narrowest exceeded scope', async () => {
     const usageStore = new InMemoryCostUsage();
     await usageStore.recordUsage(usage());
-    const input: BudgetCheckInput = {
-      workflowId: workflowId('workflow-1'), taskId: taskId('task-1'),
-      agentDefinitionId: agentDefinitionId('agent-1'), department: 'engineering',
-      taskBudget: { maxTokens: 100, maxCostUsd: 10 }, agentBudget: { maxTokens: 100, maxCostUsd: 0.2 },
+    await usageStore.recordUsage(usage({ usageId: 'usage-design', department: 'design', estimatedCostUsd: 0.9 }));
+    await usageStore.recordUsage(usage({ usageId: 'usage-other-workflow', workflowId: workflowId('workflow-2'), estimatedCostUsd: 0.9 }));
+    const input = budgetInput({
+      taskBudget: { maxTokens: 100, maxCostUsd: 10 }, agentBudget: { maxTokens: 100, maxCostUsd: 0.3 },
       workflowBudget: { maxTokens: 100, maxCostUsd: 0.1 }
-    };
-    expect(await usageStore.checkBudget(input)).toMatchObject({ kind: 'exceeded', scope: 'agent', branchTaskId: 'task-1' });
+    });
+    expect(await usageStore.checkBudget(input)).toMatchObject({ kind: 'exceeded', scope: 'workflow', branchTaskId: 'branch-root' });
+    expect(await usageStore.checkBudget({ ...input, agentBudget: { maxTokens: 100, maxCostUsd: 10 }, workflowBudget: { maxTokens: 100, maxCostUsd: 10 } }))
+      .toEqual({ kind: 'allowed' });
     expect(await usageStore.checkBudget({ ...input, agentBudget: { maxTokens: 100, maxCostUsd: 10 } }))
-      .toMatchObject({ kind: 'exceeded', scope: 'workflow', branchTaskId: 'task-1' });
+      .toMatchObject({ kind: 'exceeded', scope: 'workflow', branchTaskId: 'branch-root' });
   });
 
   it('rejects invalid budgets instead of silently allowing a dispatch', async () => {
     const usageStore = new InMemoryCostUsage();
-    const input: BudgetCheckInput = {
-      workflowId: workflowId('workflow-1'), taskId: taskId('task-1'),
-      agentDefinitionId: agentDefinitionId('agent-1'), department: 'engineering',
+    const input = budgetInput({
       taskBudget: { maxTokens: -1, maxCostUsd: 1 }, agentBudget: { maxTokens: 10, maxCostUsd: 1 },
       workflowBudget: { maxTokens: 10, maxCostUsd: 1 }
-    };
+    });
     await expect(usageStore.checkBudget(input)).rejects.toThrow(/task maxTokens/i);
   });
 });
