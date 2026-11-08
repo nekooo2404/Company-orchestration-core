@@ -17,6 +17,7 @@ export interface LaunchAgentSessionInput {
   agentDefinitionId: AgentDefinitionId;
   leaseId: string;
   sessionId: AgentSessionId;
+  idempotencyKey: AgentSessionId;
   correlationId: CorrelationId;
 }
 
@@ -79,7 +80,8 @@ const startCommand = (
   lease: Lease,
   eventId: OutboxCommand['causationId'],
   issuedAt: Date,
-  agentDefinitionId: AgentDefinitionId
+  agentDefinitionId: AgentDefinitionId,
+  idempotencyKey: AgentSessionId
 ): OutboxCommand => ({
   commandId: `start-agent-session:${task.id}:${lease.leaseId}`,
   type: 'START_AGENT_SESSION',
@@ -87,7 +89,8 @@ const startCommand = (
     taskId: task.id,
     workflowId: task.workflowId,
     agentDefinitionId,
-    leaseId: lease.leaseId
+    leaseId: lease.leaseId,
+    idempotencyKey
   },
   actor: systemActor,
   issuedAt,
@@ -123,6 +126,7 @@ export class TaskDispatcher {
       agentDefinitionId,
       leaseId: lease.leaseId,
       sessionId,
+      idempotencyKey: sessionId,
       correlationId: task.traceId
     };
 
@@ -135,12 +139,16 @@ export class TaskDispatcher {
     }
 
     if (session.sessionId !== sessionId) {
+      const mismatch = new Error(
+        `Launcher returned session ${session.sessionId}; expected persisted session ${sessionId}`
+      );
       try {
         await this.options.launcher.stop(session.sessionId, 'launcher returned a different session identity');
-        return { decision: null, releaseClaim: true };
       } catch (error) {
         throw new Error('Launcher session identity mismatch and cleanup failed', { cause: error });
       }
+      await this.persistFailure(task, lease, failureFingerprint(mismatch));
+      return { decision: null, releaseClaim: true };
     }
 
     const context = {
@@ -159,7 +167,8 @@ export class TaskDispatcher {
       lease,
       started.event.eventId,
       context.now,
-      agentDefinitionId
+      agentDefinitionId,
+      sessionId
     );
 
     try {

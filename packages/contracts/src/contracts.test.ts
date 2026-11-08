@@ -10,6 +10,7 @@ import {
   EventPayloadSchema,
   EventTypeSchema,
   OutboxCommandSchema,
+  StartAgentSessionPayloadSchema,
   TaskSchema,
   TaskIdSchema,
   TaskStateSchema,
@@ -328,6 +329,20 @@ describe('shared orchestration contracts', () => {
       OutboxCommandSchema.safeParse({ ...validCommand, payload: { taskId: taskId('task-1') } }).success
     ).toBe(false);
     expect(OutboxCommandSchema.safeParse({ ...validCommand, payload: {} }).success).toBe(false);
+  });
+
+  it('requires an explicit session idempotency key for agent session commands', () => {
+    const payload = {
+      taskId: taskId('task-1'),
+      workflowId: workflowId('workflow-1'),
+      agentDefinitionId: agentDefinitionId('agent-definition-1'),
+      leaseId: 'lease-1',
+      idempotencyKey: agentSessionId('session-1')
+    };
+
+    expect(StartAgentSessionPayloadSchema.safeParse(payload).success).toBe(true);
+    expect(StartAgentSessionPayloadSchema.safeParse({ ...payload, idempotencyKey: undefined }).success)
+      .toBe(false);
   });
 
   it('parses an approval record with a pending decision', () => {

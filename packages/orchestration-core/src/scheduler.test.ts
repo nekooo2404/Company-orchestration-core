@@ -265,9 +265,14 @@ describe('scheduler dispatch', () => {
     expect(startCall?.commands).toHaveLength(1);
     expect(startCall?.commands[0]).toMatchObject({
       type: 'START_AGENT_SESSION',
-      payload: { taskId: task.id, leaseId: decision.leaseId }
+      payload: {
+        taskId: task.id,
+        leaseId: decision.leaseId,
+        idempotencyKey: launcher.calls[0].idempotencyKey
+      }
     });
     expect(launcher.calls[0].sessionId).toBe(agentSessionId(`session:dispatch:${task.id}`));
+    expect(launcher.calls[0].idempotencyKey).toBe(launcher.calls[0].sessionId);
   });
 
   it('does not launch a second session for a repeated tick after a successful dispatch', async () => {
@@ -347,6 +352,55 @@ describe('scheduler dispatch', () => {
     })).toMatchObject({ leaseId: 'lease-proposed', sessionId, workerId: 'worker-b' });
   });
 
+  it('reuses the persisted session and idempotency key after an interrupted launch reclaim', async () => {
+    const task = makeTask('idempotent-reclaim');
+    const repository = new InMemoryTaskRepository();
+    await seedReady(repository, task);
+    const clock = new TestClock();
+    const outbox = new InMemoryOutbox({ now: () => clock.current });
+    const claims = new InMemoryDispatchClaimStore(repository);
+    const base = new TestTransactionalPersistence(repository, outbox, claims);
+    let startPersistenceFailures = 1;
+    const persistence: TransactionalPersistence = {
+      ...base,
+      saveTaskAndAppend: async (input) => {
+        if (
+          startPersistenceFailures > 0 &&
+          input.commands.some(({ type }) => type === 'START_AGENT_SESSION')
+        ) {
+          startPersistenceFailures -= 1;
+          throw new Error('start persistence unavailable');
+        }
+        await base.saveTaskAndAppend(input);
+      },
+      claimDispatch: (input) => base.claimDispatch(input),
+      releaseDispatch: (id, worker, lease) => base.releaseDispatch(id, worker, lease)
+    };
+    const launcher = new TestLauncher();
+    launcher.stopFailure = true;
+    const makeInstance = () => new TaskScheduler({
+      taskRepository: repository, transactionalPersistence: persistence, outbox, launcher, clock,
+      leaseDurationMs: 1_000, agentDefinitions: [makeAgent('agent-default', 'engineering')]
+    });
+
+    await expect(makeInstance().tick({
+      workflowId: task.workflowId, capacity: 1, workerId: 'worker-a'
+    })).rejects.toThrow(/cleanup/);
+    launcher.stopFailure = false;
+    clock.current = new Date(now.getTime() + 1_001);
+    const decisions = await makeInstance().tick({
+      workflowId: task.workflowId, capacity: 1, workerId: 'worker-b'
+    });
+
+    expect(decisions).toHaveLength(1);
+    expect(launcher.calls).toHaveLength(2);
+    expect(launcher.calls[0].idempotencyKey).toBe(launcher.calls[0].sessionId);
+    expect(launcher.calls[1]).toMatchObject({
+      sessionId: launcher.calls[0].sessionId,
+      idempotencyKey: launcher.calls[0].idempotencyKey
+    });
+  });
+
   it('does not dispatch without configured agent definitions', async () => {
     const task = makeTask('no-agent');
     const harness = makeScheduler({ tasks: [task], agents: [] });
@@ -422,10 +476,54 @@ describe('scheduler dispatch', () => {
     const task = makeTask('session-mismatch');
     const launcher = new TestLauncher();
     launcher.returnedSessionId = agentSessionId('provider-session-different');
-    const harness = makeScheduler({ tasks: [task], launcher });
+    const recovery = new TestRecoveryCoordinator();
+    const harness = makeScheduler({ tasks: [task], launcher, recovery });
     await seed(harness.repository, [task]);
     expect(await harness.scheduler.tick({ workflowId: task.workflowId, capacity: 1, workerId: 'worker-a' })).toEqual([]);
     expect(launcher.stops).toEqual(['provider-session-different']);
+    expect((await harness.repository.get(task.id))?.state).toBe('FAILED');
+    expect(recovery.requests).toHaveLength(1);
+    expect(recovery.requests[0].command.type).toBe('START_RECOVERY');
+  });
+
+  it('retains the claim when mismatch recovery persistence fails', async () => {
+    const task = makeTask('session-mismatch-persistence');
+    const repository = new InMemoryTaskRepository();
+    await seed(repository, [task]);
+    const clock = new TestClock();
+    const outbox = new InMemoryOutbox({ now: () => clock.current });
+    const claims = new InMemoryDispatchClaimStore(repository);
+    const base = new TestTransactionalPersistence(repository, outbox, claims);
+    const persistence: TransactionalPersistence = {
+      ...base,
+      saveTaskAndAppend: async (input) => {
+        if (input.commands.some(({ type }) => type === 'START_RECOVERY')) {
+          throw new Error('recovery persistence unavailable');
+        }
+        await base.saveTaskAndAppend(input);
+      },
+      claimDispatch: (input) => base.claimDispatch(input),
+      releaseDispatch: (id, worker, lease) => base.releaseDispatch(id, worker, lease)
+    };
+    const launcher = new TestLauncher();
+    launcher.returnedSessionId = agentSessionId('provider-session-different');
+    const scheduler = new TaskScheduler({
+      taskRepository: repository, transactionalPersistence: persistence, outbox, launcher, clock,
+      leaseDurationMs: 1_000, agentDefinitions: [makeAgent('agent-default', 'engineering')]
+    });
+    await expect(scheduler.tick({
+      workflowId: task.workflowId, capacity: 1, workerId: 'worker-a'
+    })).rejects.toThrow('recovery persistence unavailable');
+    expect(launcher.stops).toEqual(['provider-session-different']);
+
+    clock.current = new Date(now.getTime() + 1_001);
+    const reclaimed = await claims.claimDispatch({
+      taskId: task.id, taskVersion: 1, taskState: 'READY', workerId: 'worker-b',
+      agentDefinitionId: agentDefinitionId('agent-default'),
+      sessionId: agentSessionId(`session:dispatch:${task.id}`),
+      leaseId: 'new-lease', now: clock.current, expiresAt: new Date(clock.current.getTime() + 1_000)
+    });
+    expect(reclaimed).toMatchObject({ workerId: 'worker-b', sessionId: agentSessionId(`session:dispatch:${task.id}`) });
   });
 
   it('marks a rejected launch failed, requests one recovery and continues unrelated tasks', async () => {
