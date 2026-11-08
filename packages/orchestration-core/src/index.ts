@@ -6,6 +6,9 @@ export {
   OptimisticConcurrencyError
 } from './repository';
 export * from './task-graph';
+export * from './agent-session-manager';
+export * from './checkpoints';
+export * from './session-commands';
 export * from './task-state-machine';
 export * from './fair-queue';
 export * from './leases';
