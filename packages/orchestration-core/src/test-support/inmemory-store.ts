@@ -271,6 +271,9 @@ export class InMemoryTaskRepository implements TaskRepository {
     }
     this.tasks.set(parsedTask.id, clone(parsedTask));
   }
+
+  public snapshot(taskId: TaskId): Task | null { const task = this.tasks.get(taskId); return task ? clone(task) : null; }
+  public restore(taskId: TaskId, task: Task | null): void { if (task) this.tasks.set(taskId, clone(task)); else this.tasks.delete(taskId); }
 }
 
 export interface InMemoryOutboxOptions {
