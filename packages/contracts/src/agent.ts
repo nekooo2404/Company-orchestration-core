@@ -5,12 +5,12 @@ import {
   CorrelationIdSchema,
   TaskIdSchema,
   WorkflowIdSchema
-} from './ids';
+} from './ids.js';
 import {
   CapabilityRequirementSchema,
   OutputContractSchema,
   TaskBudgetSchema
-} from './task';
+} from './task.js';
 
 export const ActorRefSchema = z.union([
   z.object({ kind: z.literal('CEO') }),

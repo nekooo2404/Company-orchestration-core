@@ -20,6 +20,7 @@ import {
   type SaveApprovalDecisionAndTaskInput,
   type DispatchClaim,
   type DispatchClaimRequest,
+  type RecoveryRecord,
   type TransactionalPersistence
 } from '@aicompany/orchestration-core';
 import {
@@ -32,7 +33,7 @@ import {
   parseTask,
   sameOutboxCommandIdentity,
   sameValue
-} from './persistence-validation';
+} from './persistence-validation.js';
 
 export type { SaveTaskAndAppendInput } from '@aicompany/orchestration-core';
 
@@ -70,6 +71,8 @@ export interface TaskRow extends QueryResultRow {
   title: string | null;
   description: string | null;
   is_deployment: boolean | null;
+  deployment_approval_id: string | null;
+  deployment_attempt_id: string | null;
 }
 
 export interface OutboxCommandRow extends QueryResultRow {
@@ -84,6 +87,25 @@ export interface OutboxCommandRow extends QueryResultRow {
   issued_at: Date;
   correlation_id: string;
   causation_id: string;
+}
+
+export interface RecoveryRecordRow extends QueryResultRow {
+  recovery_id: string;
+  task_id: string;
+  cycle: number;
+  fingerprint: string;
+  plan: unknown;
+  state: string;
+  created_at: Date;
+  evidence_ids: unknown;
+  start_fingerprint: string | null;
+  completion_fingerprint: string | null;
+  start_idempotency_key: string | null;
+  start_request_fingerprint: string | null;
+  completion_idempotency_key: string | null;
+  completion_request_fingerprint: string | null;
+  idempotency_key: string | null;
+  request_fingerprint: string | null;
 }
 
 interface ApprovalRow extends QueryResultRow {
@@ -168,7 +190,9 @@ export const taskFromRow = (row: TaskRow): Task => TaskSchema.parse({
   ...(row.priority === null ? {} : { priority: row.priority }),
   ...(row.title === null ? {} : { title: row.title }),
   ...(row.description === null ? {} : { description: row.description }),
-  ...(row.is_deployment === null ? {} : { isDeployment: row.is_deployment })
+  ...(row.is_deployment === null ? {} : { isDeployment: row.is_deployment }),
+  ...(row.deployment_approval_id === null ? {} : { deploymentApprovalId: row.deployment_approval_id }),
+  ...(row.deployment_attempt_id === null ? {} : { deploymentAttemptId: row.deployment_attempt_id })
 });
 
 const eventParameters = (event: DomainEvent): unknown[] => [
@@ -197,6 +221,112 @@ const commandParameters = (command: OutboxCommand): unknown[] => [
   command.correlationId,
   command.causationId
 ];
+
+const recoveryActions = new Set<RecoveryRecord['plan']['action']>([
+  'RETRY', 'ALTERNATE_AGENT', 'DEPENDENCY_REPAIR', 'ROLLBACK', 'REPLAN'
+]);
+const recoveryStates = new Set<RecoveryRecord['state']>([
+  'STARTED', 'SUCCEEDED', 'FAILED', 'ESCALATED'
+]);
+
+const requiredText = (value: unknown, name: string): string => {
+  if (typeof value !== 'string' || value.trim().length === 0) {
+    throw new InvalidPersistenceOperationError(`${name} must be a non-empty string`);
+  }
+  return value.trim();
+};
+
+const stringArray = (value: unknown, name: string): string[] => {
+  if (!Array.isArray(value) || value.some((entry) => typeof entry !== 'string' || entry.trim().length === 0)) {
+    throw new InvalidPersistenceOperationError(`${name} must be an array of non-empty strings`);
+  }
+  return value.map((entry) => (entry as string).trim());
+};
+
+export const parseRecoveryRecord = (record: RecoveryRecord): RecoveryRecord => {
+  const recoveryId = requiredText(record.recoveryId, 'recoveryId');
+  const taskId = requiredText(record.taskId, 'taskId') as RecoveryRecord['taskId'];
+  if (!Number.isSafeInteger(record.cycle) || record.cycle < 1 || record.cycle > 5) {
+    throw new InvalidPersistenceOperationError('Recovery cycle must be an integer between 1 and 5');
+  }
+  if (!recoveryStates.has(record.state)) {
+    throw new InvalidPersistenceOperationError(`Unknown recovery state ${String(record.state)}`);
+  }
+  const plan = record.plan;
+  if (plan === null || typeof plan !== 'object') {
+    throw new InvalidPersistenceOperationError('Recovery plan must be an object');
+  }
+  const planValue = plan as unknown as Record<string, unknown>;
+  const strategyName = requiredText(planValue.strategyName, 'recovery plan strategyName');
+  const changedAssumption = requiredText(planValue.changedAssumption, 'recovery plan changedAssumption');
+  if (typeof planValue.action !== 'string' || !recoveryActions.has(planValue.action as RecoveryRecord['plan']['action'])) {
+    throw new InvalidPersistenceOperationError('Recovery plan action is invalid');
+  }
+  const createdAt = record.createdAt instanceof Date ? new Date(record.createdAt.getTime()) : new Date(record.createdAt);
+  if (Number.isNaN(createdAt.getTime())) {
+    throw new InvalidPersistenceOperationError('Recovery createdAt must be a valid date');
+  }
+  const startFingerprint = record.startFingerprint === undefined
+    ? undefined
+    : requiredText(record.startFingerprint, 'startFingerprint');
+  const completionFingerprint = record.completionFingerprint === undefined
+    ? undefined
+    : requiredText(record.completionFingerprint, 'completionFingerprint');
+  return {
+    recoveryId,
+    taskId,
+    cycle: record.cycle,
+    fingerprint: requiredText(record.fingerprint, 'recovery fingerprint'),
+    plan: { strategyName, changedAssumption, action: planValue.action as RecoveryRecord['plan']['action'] },
+    state: record.state,
+    createdAt,
+    evidenceIds: stringArray(record.evidenceIds, 'evidenceIds'),
+    ...(startFingerprint === undefined ? {} : { startFingerprint }),
+    ...(completionFingerprint === undefined ? {} : { completionFingerprint })
+  };
+};
+
+export const recoveryRecordFromRow = (row: RecoveryRecordRow): RecoveryRecord =>
+  parseRecoveryRecord({
+    recoveryId: row.recovery_id,
+    taskId: row.task_id as RecoveryRecord['taskId'],
+    cycle: row.cycle,
+    fingerprint: row.fingerprint,
+    plan: row.plan as RecoveryRecord['plan'],
+    state: row.state as RecoveryRecord['state'],
+    createdAt: row.created_at,
+    evidenceIds: row.evidence_ids as string[],
+    ...(row.start_fingerprint === null ? {} : { startFingerprint: row.start_fingerprint }),
+    ...(row.completion_fingerprint === null ? {} : { completionFingerprint: row.completion_fingerprint })
+  });
+
+export const recoveryRecordParameters = (
+  record: RecoveryRecord,
+  startIdempotencyKey: string | null = null,
+  startRequestFingerprint: string | null = null,
+  completionIdempotencyKey: string | null = null,
+  completionRequestFingerprint: string | null = null
+): unknown[] => {
+  const parsed = parseRecoveryRecord(record);
+  return [
+    parsed.recoveryId,
+    parsed.taskId,
+    parsed.cycle,
+    parsed.fingerprint,
+    json(parsed.plan),
+    parsed.state,
+    parsed.createdAt,
+    json(parsed.evidenceIds),
+    parsed.startFingerprint ?? null,
+    parsed.completionFingerprint ?? null,
+    startIdempotencyKey,
+    startRequestFingerprint,
+    completionIdempotencyKey,
+    completionRequestFingerprint,
+    null,
+    null
+  ];
+};
 
 const approvalFromRow = (row: ApprovalRow): ApprovalRecord => ApprovalRecordSchema.parse({
   approvalId: row.approval_id,
@@ -234,7 +364,9 @@ const updateTaskColumns = `
   priority = $16,
   title = $17,
   description = $18,
-  is_deployment = $19`;
+  is_deployment = $19,
+  deployment_approval_id = $20,
+  deployment_attempt_id = $21`;
 
 const taskParameters = (task: Task): unknown[] => [
   task.id,
@@ -255,7 +387,9 @@ const taskParameters = (task: Task): unknown[] => [
   task.priority ?? null,
   task.title ?? null,
   task.description ?? null,
-  task.isDeployment ?? null
+  task.isDeployment ?? null,
+  task.deploymentApprovalId ?? null,
+  task.deploymentAttemptId ?? null
 ];
 
 const taskInsertParameters = (task: Task): unknown[] => [
@@ -313,6 +447,12 @@ interface PreparedSaveApprovalRequestInput {
   requestFingerprint: string;
 }
 
+interface PreparedSaveRecoveryAndAppendInput extends PreparedSaveTaskAndAppendInput {
+  record: RecoveryRecord;
+  idempotencyKey: string;
+  requestFingerprint: string;
+}
+
 const prepareSaveTaskAndAppend = (
   input: SaveTaskAndAppendInput
 ): PreparedSaveTaskAndAppendInput => {
@@ -346,6 +486,26 @@ const prepareSaveTaskAndAppend = (
   }
 
   return { task, expectedVersion: input.expectedVersion, events, commands };
+};
+
+const prepareSaveRecoveryAndAppend = (
+  input: SaveTaskAndAppendInput & {
+    record: RecoveryRecord;
+    idempotencyKey: string;
+    requestFingerprint: string;
+  }
+): PreparedSaveRecoveryAndAppendInput => {
+  const prepared = prepareSaveTaskAndAppend(input);
+  const record = parseRecoveryRecord(input.record);
+  if (record.taskId !== prepared.task.id) {
+    throw new InvalidPersistenceOperationError('Recovery record task does not match the task snapshot');
+  }
+  return {
+    ...prepared,
+    record,
+    idempotencyKey: canonicalId(input.idempotencyKey, 'idempotencyKey'),
+    requestFingerprint: canonicalId(input.requestFingerprint, 'requestFingerprint')
+  };
 };
 
 const prepareSaveApprovalDecisionAndTask = (
@@ -460,10 +620,10 @@ export const saveTaskSnapshot = async (
          task_id, workflow_id, state, dependency_ids, recovery_cycles, version, updated_at,
          required_capabilities, output_contract, budget, project_id, parent_task_id,
          owner_agent_definition_id, deadline, trace_id, created_at, priority, title,
-         description, is_deployment
+         description, is_deployment, deployment_approval_id, deployment_attempt_id
        ) VALUES (
          $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-         $11, $12, $13, $14, $15, $20, $16, $17, $18, $19
+         $11, $12, $13, $14, $15, $22, $16, $17, $18, $19, $20, $21
        )`,
       taskInsertParameters(validatedTask)
     );
@@ -482,13 +642,110 @@ export const saveTaskSnapshot = async (
 
   const updated = await client.query(
     `UPDATE tasks SET ${updateTaskColumns}
-     WHERE task_id = $1 AND version = $20`,
+     WHERE task_id = $1 AND version = $22`,
     [...taskParameters(validatedTask), expectedVersion]
   );
   if (updated.rowCount !== 1) {
     throw new OptimisticConcurrencyError(validatedTask.id, expectedVersion, actualVersion);
   }
 }
+
+const saveRecoveryRecord = async (
+  client: PoolClient,
+  input: PreparedSaveRecoveryAndAppendInput
+): Promise<boolean> => {
+  const existingResult = await client.query<RecoveryRecordRow>(
+    `SELECT recovery_id, task_id, cycle, fingerprint, plan, state, created_at, evidence_ids,
+            start_fingerprint, completion_fingerprint,
+            start_idempotency_key, start_request_fingerprint,
+            completion_idempotency_key, completion_request_fingerprint,
+            idempotency_key, request_fingerprint
+     FROM recovery_records
+     WHERE recovery_id = $1 OR start_idempotency_key = $2 OR completion_idempotency_key = $2
+        OR idempotency_key = $2
+     ORDER BY CASE WHEN recovery_id = $1 THEN 0 ELSE 1 END
+     LIMIT 1
+     FOR UPDATE`,
+    [input.record.recoveryId, input.idempotencyKey]
+  );
+  const existing = existingResult.rows[0];
+  if (existing !== undefined) {
+    const stored = recoveryRecordFromRow(existing);
+    const replayed = input.record.state === 'STARTED'
+      ? (existing.start_idempotency_key ?? existing.idempotency_key) === input.idempotencyKey &&
+        (existing.start_request_fingerprint ?? existing.request_fingerprint) === input.requestFingerprint
+      : (existing.completion_idempotency_key === input.idempotencyKey &&
+        existing.completion_request_fingerprint === input.requestFingerprint);
+    if (replayed) {
+      if (!sameValue(stored, input.record)) {
+        throw new DuplicatePersistenceIdError('recovery record', input.idempotencyKey);
+      }
+      return true;
+    }
+    if (input.record.state === 'STARTED' || existing.state !== 'STARTED' || existing.recovery_id !== input.record.recoveryId) {
+      throw new DuplicatePersistenceIdError('recovery record', input.idempotencyKey);
+    }
+    if (stored.taskId !== input.record.taskId || stored.cycle !== input.record.cycle ||
+        stored.fingerprint !== input.record.fingerprint ||
+        !sameValue(stored.plan, input.record.plan) ||
+        stored.createdAt.getTime() !== input.record.createdAt.getTime() ||
+        stored.startFingerprint !== input.record.startFingerprint) {
+      throw new DuplicatePersistenceIdError('recovery record', input.idempotencyKey);
+    }
+
+    await client.query(
+      `UPDATE recovery_records
+       SET state = $2,
+           evidence_ids = $3,
+           completion_fingerprint = $4,
+           completion_idempotency_key = $5,
+           completion_request_fingerprint = $6
+       WHERE recovery_id = $1
+         AND state = 'STARTED'
+         AND completion_idempotency_key IS NULL`,
+      [
+        input.record.recoveryId,
+        input.record.state,
+        json(input.record.evidenceIds),
+        input.record.completionFingerprint ?? null,
+        input.idempotencyKey,
+        input.requestFingerprint
+      ]
+    );
+    return false;
+  }
+
+  if (input.record.state !== 'STARTED') {
+    throw new InvalidPersistenceOperationError('A recovery record must be started before completion');
+  }
+
+  await client.query(
+    `INSERT INTO recovery_records (
+       recovery_id, task_id, cycle, fingerprint, plan, state, created_at, evidence_ids,
+       start_fingerprint, completion_fingerprint,
+       start_idempotency_key, start_request_fingerprint,
+       completion_idempotency_key, completion_request_fingerprint,
+       idempotency_key, request_fingerprint
+     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)`,
+    recoveryRecordParameters(input.record, input.idempotencyKey, input.requestFingerprint)
+  );
+  return false;
+};
+
+const retireRecoveredTaskDispatch = async (
+  client: PoolClient,
+  taskId: Task['id']
+): Promise<void> => {
+  await client.query('DELETE FROM task_dispatch_claims WHERE task_id = $1', [taskId]);
+  await client.query(
+    `UPDATE outbox_commands
+     SET completed_at = COALESCE(completed_at, CURRENT_TIMESTAMP)
+     WHERE command_type = 'START_AGENT_SESSION'
+       AND completed_at IS NULL
+       AND payload ->> 'taskId' = $1`,
+    [taskId]
+  );
+};
 
 const saveApprovalDecision = async (
   client: PoolClient,
@@ -570,7 +827,7 @@ const saveApprovalDecision = async (
 const saveApprovalRequestRecord = async (
   client: PoolClient,
   input: PreparedSaveApprovalRequestInput
-): Promise<ApprovalRecord> => {
+): Promise<{ record: ApprovalRecord; replayed: boolean }> => {
   const existingResult = await client.query<ApprovalRow>(
     `SELECT approval_id, subject_type, subject_id, reason, requested_by, correlation_id,
             causation_id, state, decision, decision_reason, decided_by, decided_at,
@@ -590,7 +847,7 @@ const saveApprovalRequestRecord = async (
     ) {
       throw new DuplicatePersistenceIdError('approval request', input.idempotencyKey);
     }
-    return approvalFromRow(existing);
+    return { record: approvalFromRow(existing), replayed: true };
   }
 
   await client.query(
@@ -614,7 +871,7 @@ const saveApprovalRequestRecord = async (
       input.requestFingerprint
     ]
   );
-  return input.approval;
+  return { record: input.approval, replayed: false };
 };
 
 const appendApprovalRequestWithClient = async (
@@ -668,6 +925,35 @@ const appendApprovalRequestWithClient = async (
 
 export class PostgresStore implements EventStore, TransactionalPersistence {
   public constructor(private readonly pool: Pool) {}
+
+  public async saveRecoveryAndAppend(input: SaveTaskAndAppendInput & {
+    record: RecoveryRecord;
+    idempotencyKey: string;
+    requestFingerprint: string;
+  }): Promise<void> {
+    const prepared = prepareSaveRecoveryAndAppend(input);
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      await lockAggregate(client, prepared.task.id);
+      await lockAggregate(client, `recovery-request:${prepared.idempotencyKey}`);
+      const replayed = await saveRecoveryRecord(client, prepared);
+      if (!replayed) {
+        await saveTaskSnapshot(client, prepared.task, prepared.expectedVersion);
+        await this.appendEvents(client, prepared.events, prepared.expectedVersion);
+        await this.enqueueCommands(client, prepared.commands);
+        if (prepared.record.state === 'SUCCEEDED' && prepared.task.state === 'READY') {
+          await retireRecoveredTaskDispatch(client, prepared.task.id);
+        }
+      }
+      await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK').catch(() => undefined);
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
 
   public async append(events: readonly DomainEvent[], expectedVersion: number): Promise<void> {
     assertVersion(expectedVersion, 'expectedVersion');
@@ -760,10 +1046,12 @@ export class PostgresStore implements EventStore, TransactionalPersistence {
       await lockAggregate(client, `approval-request:${prepared.idempotencyKey}`);
       await lockAggregate(client, prepared.approval.approvalId);
       const persisted = await saveApprovalRequestRecord(client, prepared);
-      await appendApprovalRequestWithClient(client, prepared.requestEvent);
-      await this.enqueueCommands(client, [prepared.command]);
+      if (!persisted.replayed) {
+        await appendApprovalRequestWithClient(client, prepared.requestEvent);
+        await this.enqueueCommands(client, [prepared.command]);
+      }
       await client.query('COMMIT');
-      return persisted;
+      return persisted.record;
     } catch (error) {
       await client.query('ROLLBACK').catch(() => undefined);
       throw error;
@@ -811,6 +1099,7 @@ export class PostgresStore implements EventStore, TransactionalPersistence {
     const client = await this.pool.connect();
     try {
       await client.query('BEGIN');
+      await lockAggregate(client, `agent-capacity:${agentId}`);
       const taskResult = await client.query<{ version: number; state: string }>(
         'SELECT version, state FROM tasks WHERE task_id = $1 FOR UPDATE', [taskIdValue]
       );
@@ -819,19 +1108,40 @@ export class PostgresStore implements EventStore, TransactionalPersistence {
         await client.query('ROLLBACK');
         return null;
       }
+      if (input.maxConcurrency !== undefined) {
+        const usage = await client.query<{ running: string; pending: string }>(
+          `SELECT (SELECT COUNT(*) FROM tasks WHERE owner_agent_definition_id = $1 AND state = 'RUNNING')::text AS running,
+                  (SELECT COUNT(*) FROM task_dispatch_claims c JOIN tasks t ON t.task_id = c.task_id
+                   WHERE c.agent_definition_id = $1 AND c.task_id <> $2 AND t.state = 'READY'
+                   AND c.expires_at > $3 AND c.cleanup_in_progress = false)::text AS pending`,
+          [agentId, taskIdValue, input.now]
+        );
+        if (Number(usage.rows[0].running) + Number(usage.rows[0].pending) >= input.maxConcurrency) {
+          await client.query('ROLLBACK');
+          return null;
+        }
+      }
       const result = await client.query<{
       task_id: string; worker_id: string; agent_definition_id: string; lease_id: string;
       expires_at: Date; session_id: string; task_version: number; task_state: string;
+      generation: number; cleanup_in_progress: boolean;
     }>(
       `INSERT INTO task_dispatch_claims (task_id, worker_id, agent_definition_id, task_version, task_state, lease_id, session_id, expires_at)
        VALUES ($1, $2, $3, $4, 'READY', $5, $6, $7)
        ON CONFLICT (task_id) DO UPDATE SET worker_id = EXCLUDED.worker_id, expires_at = EXCLUDED.expires_at,
-         task_version = EXCLUDED.task_version, task_state = EXCLUDED.task_state
-       WHERE task_dispatch_claims.expires_at <= $8
-         AND task_dispatch_claims.agent_definition_id = EXCLUDED.agent_definition_id
-         AND task_dispatch_claims.task_version = EXCLUDED.task_version
-         AND task_dispatch_claims.session_id = EXCLUDED.session_id
-       RETURNING task_id, worker_id, agent_definition_id, lease_id, expires_at, session_id, task_version, task_state`,
+         task_version = EXCLUDED.task_version, task_state = EXCLUDED.task_state,
+         lease_id = CASE WHEN task_dispatch_claims.task_version = EXCLUDED.task_version
+           THEN task_dispatch_claims.lease_id ELSE EXCLUDED.lease_id END,
+         session_id = CASE WHEN task_dispatch_claims.task_version = EXCLUDED.task_version
+           THEN task_dispatch_claims.session_id ELSE EXCLUDED.session_id END,
+         generation = task_dispatch_claims.generation + 1, cleanup_in_progress = false
+       WHERE task_dispatch_claims.cleanup_in_progress = false
+         AND (task_dispatch_claims.task_version < EXCLUDED.task_version OR task_dispatch_claims.expires_at <= $8)
+         AND (task_dispatch_claims.task_version < EXCLUDED.task_version OR
+           (task_dispatch_claims.agent_definition_id = EXCLUDED.agent_definition_id AND
+            task_dispatch_claims.session_id = EXCLUDED.session_id))
+       RETURNING task_id, worker_id, agent_definition_id, lease_id, expires_at, session_id, task_version, task_state,
+                 generation, cleanup_in_progress`,
       [taskIdValue, workerId, agentId, input.taskVersion, leaseId, sessionId, input.expiresAt, input.now]
     );
       await client.query('COMMIT');
@@ -840,7 +1150,8 @@ export class PostgresStore implements EventStore, TransactionalPersistence {
         taskId: row.task_id as DispatchClaim['taskId'], workerId: row.worker_id,
         agentDefinitionId: row.agent_definition_id as DispatchClaim['agentDefinitionId'],
         taskVersion: row.task_version, taskState: row.task_state as DispatchClaim['taskState'],
-        leaseId: row.lease_id, sessionId: agentSessionId(row.session_id), now: input.now, expiresAt: row.expires_at
+        leaseId: row.lease_id, sessionId: agentSessionId(row.session_id), now: input.now, expiresAt: row.expires_at,
+        generation: row.generation, cleanupInProgress: row.cleanup_in_progress
       };
     } catch (error) {
       await client.query('ROLLBACK').catch(() => undefined);
@@ -848,6 +1159,41 @@ export class PostgresStore implements EventStore, TransactionalPersistence {
     } finally {
       client.release();
     }
+  }
+
+  public async getDispatchClaim(taskId: Task['id']): Promise<DispatchClaim | null> {
+    const result = await this.pool.query<{
+      task_id: string; worker_id: string; agent_definition_id: string; lease_id: string;
+      expires_at: Date; session_id: string; task_version: number; task_state: string;
+      generation: number; cleanup_in_progress: boolean;
+    }>(`SELECT task_id, worker_id, agent_definition_id, lease_id, expires_at, session_id,
+              task_version, task_state, generation, cleanup_in_progress
+           FROM task_dispatch_claims WHERE task_id = $1`, [taskId]);
+    const row = result.rows[0];
+    return row ? { taskId: row.task_id as Task['id'], workerId: row.worker_id,
+      agentDefinitionId: row.agent_definition_id as DispatchClaim['agentDefinitionId'],
+      taskVersion: row.task_version, taskState: row.task_state as DispatchClaim['taskState'],
+      leaseId: row.lease_id, sessionId: agentSessionId(row.session_id), now: new Date(0),
+      expiresAt: row.expires_at, generation: row.generation, cleanupInProgress: row.cleanup_in_progress } : null;
+  }
+
+  public async beginDispatchCleanup(taskId: Task['id'], workerId: string, leaseId: string, generation: number): Promise<boolean> {
+    const result = await this.pool.query(
+      `UPDATE task_dispatch_claims SET cleanup_in_progress = true
+       WHERE task_id = $1 AND worker_id = $2 AND lease_id = $3 AND generation = $4
+         AND cleanup_in_progress = false AND EXISTS
+         (SELECT 1 FROM tasks WHERE task_id = $1 AND state = 'READY' AND version = task_dispatch_claims.task_version)`,
+      [taskId, workerId, leaseId, generation]
+    );
+    return result.rowCount === 1;
+  }
+
+  public async abortDispatchCleanup(taskId: Task['id'], workerId: string, leaseId: string, generation: number): Promise<void> {
+    await this.pool.query(
+      `UPDATE task_dispatch_claims SET cleanup_in_progress = false
+       WHERE task_id = $1 AND worker_id = $2 AND lease_id = $3 AND generation = $4`,
+      [taskId, workerId, leaseId, generation]
+    );
   }
 
   public async releaseDispatch(taskId: Task['id'], workerId: string, leaseId: string): Promise<boolean> {

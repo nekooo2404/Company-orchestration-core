@@ -7,11 +7,11 @@ import {
   type Task,
   type TaskId
 } from '@aicompany/contracts';
-import { failureFingerprint } from './failure-fingerprint';
-import type { FailureContext, RecoveryCoordinator } from './recovery';
-import { transitionTask } from './task-state-machine';
-import type { Clock, Lease } from './leases';
-import type { Outbox, TransactionalPersistence } from './ports';
+import { failureFingerprint } from './failure-fingerprint.js';
+import type { FailureContext, RecoveryCoordinator, RecoveryEventConsumer } from './recovery.js';
+import { transitionTask } from './task-state-machine.js';
+import type { Clock, Lease } from './leases.js';
+import type { DispatchClaim, Outbox, TransactionalPersistence } from './ports.js';
 
 export interface LaunchAgentSessionInput {
   taskId: TaskId;
@@ -19,11 +19,13 @@ export interface LaunchAgentSessionInput {
   agentDefinitionId: AgentDefinitionId;
   leaseId: string;
   sessionId: AgentSessionId;
+  expectedTaskVersion: number;
   idempotencyKey: AgentSessionId;
   correlationId: CorrelationId;
 }
 
 export interface AgentSessionLauncher {
+  readonly persistsStart?: boolean;
   launch(input: LaunchAgentSessionInput): Promise<AgentSession>;
   stop(sessionId: AgentSessionId, reason: string): Promise<void>;
 }
@@ -36,7 +38,8 @@ export interface DispatchDecision {
   correlationId: CorrelationId;
 }
 
-export type DispatchRecoveryCoordinator = Pick<RecoveryCoordinator, 'start'>;
+export type DispatchRecoveryCoordinator = Pick<RecoveryCoordinator, 'start'> &
+  Partial<Pick<RecoveryEventConsumer, 'handleTaskEvent'>>;
 
 export interface DispatchOptions {
   transactionalPersistence: TransactionalPersistence;
@@ -51,6 +54,7 @@ export interface DispatchTaskInput {
   agentDefinitionId: AgentDefinitionId;
   lease: Lease;
   sessionId: AgentSessionId;
+  claim?: DispatchClaim;
 }
 
 export interface DispatchResult {
@@ -111,13 +115,14 @@ export class TaskDispatcher {
   public constructor(private readonly options: DispatchOptions) {}
 
   public async dispatch(input: DispatchTaskInput): Promise<DispatchResult> {
-    const { task, agentDefinitionId, lease, sessionId } = input;
+    const { task, agentDefinitionId, lease, sessionId, claim } = input;
     const launchInput: LaunchAgentSessionInput = {
       taskId: task.id,
       workflowId: task.workflowId,
       agentDefinitionId,
       leaseId: lease.leaseId,
       sessionId,
+      expectedTaskVersion: task.version,
       idempotencyKey: sessionId,
       correlationId: task.traceId
     };
@@ -126,6 +131,7 @@ export class TaskDispatcher {
     try {
       session = await this.options.launcher.launch(launchInput);
     } catch (error) {
+      if (this.options.launcher.persistsStart) return { decision: null, releaseClaim: false };
       await this.persistFailure(task, sessionId, error);
       return { decision: null, releaseClaim: true };
     }
@@ -142,6 +148,11 @@ export class TaskDispatcher {
       await this.persistFailure(task, sessionId, mismatch);
       return { decision: null, releaseClaim: true };
     }
+
+    if (this.options.launcher.persistsStart) return { decision: {
+      taskId: task.id, agentDefinitionId, leaseId: lease.leaseId,
+      expiresAt: new Date(lease.expiresAt), correlationId: task.traceId
+    }, releaseClaim: false };
 
     const context = {
       actor: systemActor,
@@ -171,10 +182,19 @@ export class TaskDispatcher {
         commands: [command]
       });
     } catch (error) {
+      if (claim) {
+        const fenced = await this.options.transactionalPersistence.beginDispatchCleanup(
+          task.id, claim.workerId, claim.leaseId, claim.generation
+        );
+        if (!fenced) return { decision: null, releaseClaim: false };
+      }
       try {
         await this.options.launcher.stop(session.sessionId, 'dispatch persistence failed');
         return { decision: null, releaseClaim: true };
       } catch (stopError) {
+        if (claim) await this.options.transactionalPersistence.abortDispatchCleanup(
+          task.id, claim.workerId, claim.leaseId, claim.generation
+        );
         throw new AggregateError([error, stopError], 'Dispatch persistence and provider cleanup both failed');
       }
     }
@@ -212,11 +232,11 @@ export class TaskDispatcher {
       events: [failed.event],
       commands: []
     });
-    await this.options.recoveryCoordinator?.start({
-      taskId: task.id,
-      failure,
-      actor: systemActor,
-      correlationId: task.traceId,
-    });
+    const recovery = this.options.recoveryCoordinator;
+    if (recovery?.handleTaskEvent) {
+      await recovery.handleTaskEvent(failed.event, failure);
+      return;
+    }
+    await recovery?.start({ taskId: task.id, failure, actor: systemActor, correlationId: task.traceId });
   }
 }

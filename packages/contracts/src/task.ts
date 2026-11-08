@@ -4,7 +4,7 @@ import {
   CorrelationIdSchema,
   TaskIdSchema,
   WorkflowIdSchema
-} from './ids';
+} from './ids.js';
 
 const nonEmptyText = z.string().refine((value) => value.trim().length > 0, {
   message: 'Value cannot be empty'
@@ -57,6 +57,8 @@ export const TaskSchema = z.object({
   priority: z.number().int().optional(),
   title: nonEmptyText.optional(),
   description: z.string().optional(),
-  isDeployment: z.boolean().optional()
+  isDeployment: z.boolean().optional(),
+  deploymentApprovalId: nonEmptyText.optional(),
+  deploymentAttemptId: nonEmptyText.optional()
 });
 export type Task = z.infer<typeof TaskSchema>;

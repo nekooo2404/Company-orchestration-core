@@ -5,9 +5,10 @@ import {
 import { TaskDispatcher, type AgentSessionLauncher, type LaunchAgentSessionInput } from './dispatch';
 import { createDefaultRecoveryStrategies } from './recovery-strategies';
 import { InMemoryRecoveryRecordStore, RecoveryCoordinatorService } from './recovery';
-import { InMemoryDispatchClaimStore, InMemoryEventStore, InMemoryOutbox, InMemoryTaskRepository, InMemoryTransactionalPersistence } from './test-support/inmemory-store';
+import { InMemoryApprovalTransactionalPersistence, InMemoryDispatchClaimStore, InMemoryEventStore, InMemoryOutbox, InMemoryTaskRepository, InMemoryTransactionalPersistence } from './test-support/inmemory-store';
+import { InMemoryApprovalStore } from './approvals';
 import type { AgentSession } from '@aicompany/contracts';
-import type { SaveApprovalDecisionAndTaskInput, SaveApprovalRequestInput, SaveTaskAndAppendInput, TransactionalPersistence } from './ports';
+import type { SaveTaskAndAppendInput, TransactionalPersistence } from './ports';
 
 const now = new Date('2026-11-08T00:00:00.000Z');
 
@@ -28,34 +29,24 @@ class FailingLauncher implements AgentSessionLauncher {
   public async stop(): Promise<void> {}
 }
 
-class AtomicMemoryPersistence implements TransactionalPersistence {
+class AtomicMemoryPersistence extends InMemoryApprovalTransactionalPersistence {
   public readonly calls: SaveTaskAndAppendInput[] = [];
 
   public constructor(
-    private readonly tasks: InMemoryTaskRepository,
-    private readonly events: InMemoryEventStore,
-    private readonly outbox: InMemoryOutbox
-  ) {}
+    tasks: InMemoryTaskRepository,
+    events: InMemoryEventStore,
+    outbox: InMemoryOutbox,
+    records: InMemoryRecoveryRecordStore
+  ) { super({ tasks, events, outbox, approvals: new InMemoryApprovalStore(), records }); }
 
   public async saveTaskAndAppend(input: SaveTaskAndAppendInput): Promise<void> {
     this.calls.push(input);
-    await this.tasks.save(input.task, input.expectedVersion);
-    await this.events.append(input.events, input.expectedVersion);
-    for (const command of input.commands) await this.outbox.enqueue(command);
+    await super.saveTaskAndAppend(input);
   }
-
-  public async saveApprovalDecisionAndTask(input: SaveApprovalDecisionAndTaskInput): Promise<void> {
-    void input;
-    throw new Error('atomic approval persistence is not used by dispatcher recovery');
+  public override async saveRecoveryAndAppend(input: Parameters<TransactionalPersistence['saveRecoveryAndAppend']>[0]): Promise<void> {
+    this.calls.push(input);
+    await super.saveRecoveryAndAppend(input);
   }
-
-  public async saveApprovalRequest(input: SaveApprovalRequestInput) {
-    void input;
-    throw new Error('atomic approval request persistence is not used by dispatcher recovery');
-  }
-
-  public async claimDispatch() { return null; }
-  public async releaseDispatch(): Promise<boolean> { return false; }
 }
 
 describe('dispatcher recovery wiring', () => {
@@ -64,8 +55,8 @@ describe('dispatcher recovery wiring', () => {
     const tasks = new InMemoryTaskRepository();
     const events = new InMemoryEventStore();
     const outbox = new InMemoryOutbox({ now: () => now });
-    const persistence = new AtomicMemoryPersistence(tasks, events, outbox);
     const records = new InMemoryRecoveryRecordStore();
+    const persistence = new AtomicMemoryPersistence(tasks, events, outbox, records);
     const transactional = new InMemoryTransactionalPersistence(
       persistence,
       new InMemoryDispatchClaimStore(tasks)

@@ -1,4 +1,4 @@
-export { runFiftyAgentScenario, runRecoveryScenario } from './scenario';
-export type { RecoveryScenarioResult, ScenarioResult } from './scenario';
-export { SimulatedAgent } from './simulated-agent';
-export type { SimulatedAgentResult, SimulatedArtifact } from './simulated-agent';
+export { runFiftyAgentScenario, runRecoveryScenario } from './scenario.js';
+export type { RecoveryScenarioResult, ScenarioResult } from './scenario.js';
+export { SimulatedAgent } from './simulated-agent.js';
+export type { SimulatedAgentResult, SimulatedArtifact } from './simulated-agent.js';

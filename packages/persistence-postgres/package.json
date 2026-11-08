@@ -14,7 +14,8 @@
   "scripts": {
     "build": "tsc -b",
     "test": "vitest run --passWithNoTests --config vitest.config.ts",
-    "typecheck": "tsc -b"
+    "typecheck": "tsc -b",
+    "test:node-import": "node scripts/smoke-built-packages.mjs"
   },
   "dependencies": {
     "@aicompany/contracts": "workspace:*",

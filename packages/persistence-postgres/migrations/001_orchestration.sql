@@ -24,8 +24,47 @@ CREATE TABLE IF NOT EXISTS tasks (
   priority integer,
   title text,
   description text,
-  is_deployment boolean
+  is_deployment boolean,
+  deployment_approval_id text,
+  deployment_attempt_id text
 );
+
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS deployment_approval_id text;
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS deployment_attempt_id text;
+
+CREATE TABLE IF NOT EXISTS recovery_records (
+  recovery_id text PRIMARY KEY,
+  task_id text NOT NULL REFERENCES tasks(task_id) ON DELETE CASCADE,
+  cycle integer NOT NULL CHECK (cycle > 0 AND cycle <= 5),
+  fingerprint text NOT NULL,
+  plan jsonb NOT NULL,
+  state text NOT NULL CHECK (state IN ('STARTED', 'SUCCEEDED', 'FAILED', 'ESCALATED')),
+  created_at timestamptz NOT NULL,
+  evidence_ids jsonb NOT NULL,
+  start_fingerprint text,
+  completion_fingerprint text,
+  start_idempotency_key text,
+  start_request_fingerprint text,
+  completion_idempotency_key text,
+  completion_request_fingerprint text,
+  idempotency_key text,
+  request_fingerprint text
+);
+
+ALTER TABLE recovery_records ADD COLUMN IF NOT EXISTS start_idempotency_key text;
+ALTER TABLE recovery_records ADD COLUMN IF NOT EXISTS start_request_fingerprint text;
+ALTER TABLE recovery_records ADD COLUMN IF NOT EXISTS completion_idempotency_key text;
+ALTER TABLE recovery_records ADD COLUMN IF NOT EXISTS completion_request_fingerprint text;
+
+CREATE UNIQUE INDEX IF NOT EXISTS recovery_records_idempotency_key
+  ON recovery_records (idempotency_key)
+  WHERE idempotency_key IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS recovery_records_start_idempotency_key
+  ON recovery_records (start_idempotency_key)
+  WHERE start_idempotency_key IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS recovery_records_completion_idempotency_key
+  ON recovery_records (completion_idempotency_key)
+  WHERE completion_idempotency_key IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS agent_sessions (
   session_id text PRIMARY KEY,
@@ -52,8 +91,13 @@ CREATE TABLE IF NOT EXISTS task_dispatch_claims (
   task_state text NOT NULL CHECK (task_state = 'READY'),
   lease_id text NOT NULL UNIQUE,
   session_id text NOT NULL,
+  generation integer NOT NULL DEFAULT 1,
+  cleanup_in_progress boolean NOT NULL DEFAULT false,
   expires_at timestamptz NOT NULL
 );
+
+ALTER TABLE task_dispatch_claims ADD COLUMN IF NOT EXISTS generation integer NOT NULL DEFAULT 1;
+ALTER TABLE task_dispatch_claims ADD COLUMN IF NOT EXISTS cleanup_in_progress boolean NOT NULL DEFAULT false;
 
 CREATE TABLE IF NOT EXISTS domain_events (
   event_id text PRIMARY KEY,

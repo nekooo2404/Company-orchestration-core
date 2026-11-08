@@ -27,6 +27,29 @@ const budgetInput = (overrides: Partial<BudgetCheckInput> = {}): BudgetCheckInpu
 });
 
 describe('cost accounting', () => {
+  it('preserves reserved model and department names without prototype pollution', async () => {
+    const sink = new InMemoryCostSink();
+    await sink.recordUsage(usage({ model: '__proto__', department: 'constructor' }));
+    const summary = await sink.getWorkflowCost(workflowId('workflow-1'));
+    expect(summary.byModel['__proto__']).toBe(0.25);
+    expect(summary.byDepartment.constructor).toBe(0.25);
+    expect(Object.getPrototypeOf(summary.byModel)).toBeNull();
+  });
+
+  it('charges a task projection to its agent and workflow parents', async () => {
+    const usageStore = new InMemoryCostUsage();
+    await usageStore.recordUsage(usage({ taskId: taskId('earlier-task') }));
+    expect(await usageStore.checkBudget(budgetInput({
+      projectedInputTokens: 5, projectedCostUsd: 0.1,
+      agentBudget: { maxTokens: 19, maxCostUsd: 1 },
+      workflowBudget: { maxTokens: 100, maxCostUsd: 10 }
+    }))).toMatchObject({ kind: 'exceeded', scope: 'agent' });
+    expect(await usageStore.checkBudget(budgetInput({
+      projectedInputTokens: 5, projectedCostUsd: 0.1,
+      agentBudget: { maxTokens: 100, maxCostUsd: 10 },
+      workflowBudget: { maxTokens: 19, maxCostUsd: 1 }
+    }))).toMatchObject({ kind: 'exceeded', scope: 'workflow' });
+  });
   it('records token, model, provider, endpoint, task, agent and department usage', async () => {
     const sink = new InMemoryCostSink();
     await sink.recordUsage(usage());
@@ -107,7 +130,7 @@ describe('cost accounting', () => {
     expect(decision).toMatchObject({ kind: 'exceeded', scope: 'task', branchTaskId: 'branch-root' });
   });
 
-  it('charges task projections to the task budget without falsely charging an unrelated agent budget', async () => {
+  it('charges task projections to the task and parent budgets', async () => {
     const usageStore = new InMemoryCostUsage();
     const projection = budgetInput({
       projectedScope: 'task', projectedInputTokens: 6, projectedOutputTokens: 0, projectedCostUsd: 0.6,
@@ -118,7 +141,7 @@ describe('cost accounting', () => {
     expect(await usageStore.checkBudget({
       ...projection,
       taskBudget: { maxTokens: 100, maxCostUsd: 10 }
-    })).toEqual({ kind: 'allowed' });
+    })).toMatchObject({ kind: 'exceeded', scope: 'agent' });
   });
 
   it('charges a workflow projection to the workflow budget', async () => {

@@ -1,4 +1,4 @@
-import type { RecoveryPlan, RecoveryStrategy } from './recovery';
+import type { RecoveryPlan, RecoveryStrategy } from './recovery.js';
 
 const plans: readonly RecoveryPlan[] = [
   {

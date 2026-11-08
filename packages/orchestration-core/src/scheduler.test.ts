@@ -151,6 +151,13 @@ class TestTransactionalPersistence implements TransactionalPersistence {
   }
 
   public claimDispatch(input: DispatchClaimRequest) { return this.claims.claimDispatch(input); }
+  public getDispatchClaim(taskId: Task['id']) { return this.claims.getDispatchClaim(taskId); }
+  public beginDispatchCleanup(taskId: Task['id'], workerId: string, leaseId: string, generation: number) {
+    return this.claims.beginDispatchCleanup(taskId, workerId, leaseId, generation);
+  }
+  public abortDispatchCleanup(taskId: Task['id'], workerId: string, leaseId: string, generation: number) {
+    return this.claims.abortDispatchCleanup(taskId, workerId, leaseId, generation);
+  }
   public releaseDispatch(taskId: Task['id'], workerId: string, leaseId: string) {
     return this.claims.releaseDispatch(taskId, workerId, leaseId);
   }
@@ -225,6 +232,72 @@ const seedReady = async (repository: InMemoryTaskRepository, task: Task): Promis
 };
 
 describe('scheduler dispatch', () => {
+  it('never stops the winning session after a lease is reclaimed and the old worker conflicts', async () => {
+    const task = makeTask('stale-worker');
+    const repository = new InMemoryTaskRepository();
+    await seedReady(repository, task);
+    const clock = new TestClock();
+    const outbox = new InMemoryOutbox({ now: () => clock.current });
+    const claims = new InMemoryDispatchClaimStore(repository);
+    const persistence = new TestTransactionalPersistence(repository, outbox, claims);
+    const launcher = new TestLauncher();
+    let firstLaunched!: () => void;
+    let releaseFirst!: () => void;
+    const launched = new Promise<void>((resolve) => { firstLaunched = resolve; });
+    const hold = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    launcher.launch = async (input) => {
+      launcher.calls.push(input);
+      if (launcher.calls.length === 1) { firstLaunched(); await hold; }
+      return makeSession(input);
+    };
+    const scheduler = new TaskScheduler({ taskRepository: repository, transactionalPersistence: persistence,
+      outbox, launcher, clock, leaseDurationMs: 1000, agentDefinitions: [makeAgent('agent-default', 'engineering')] });
+    const stale = scheduler.tick({ workflowId: task.workflowId, capacity: 1, workerId: 'worker-a' });
+    await launched;
+    clock.current = new Date(now.getTime() + 1001);
+    const winner = await scheduler.tick({ workflowId: task.workflowId, capacity: 1, workerId: 'worker-b' });
+    releaseFirst();
+    expect(winner).toHaveLength(1);
+    expect(await stale).toEqual([]);
+    expect(launcher.stops).toEqual([]);
+    expect((await repository.get(task.id))?.state).toBe('RUNNING');
+  });
+  it('renews dispatch identity after recovery changes the task version', async () => {
+    const task = makeTask('recovered-dispatch');
+    const repository = new InMemoryTaskRepository();
+    const ready = await seedReady(repository, task);
+    const claims = new InMemoryDispatchClaimStore(repository);
+    await claims.claimDispatch({ taskId: task.id, taskVersion: ready.version, taskState: 'READY', workerId: 'old',
+      agentDefinitionId: agentDefinitionId('agent-default'), sessionId: agentSessionId('session:dispatch:recovered-dispatch:v1'),
+      leaseId: 'dispatch:recovered-dispatch:v1', now, expiresAt: new Date(now.getTime() + 1) });
+    await repository.save({ ...ready, version: 2, state: 'RECOVERING' }, 1);
+    await repository.save({ ...ready, version: 3, state: 'READY', recoveryCycles: 1 }, 2);
+    const outbox = new InMemoryOutbox({ now: () => now });
+    const launcher = new TestLauncher();
+    const scheduler = new TaskScheduler({ taskRepository: repository,
+      transactionalPersistence: new TestTransactionalPersistence(repository, outbox, claims), outbox, launcher,
+      clock: new TestClock(), agentDefinitions: [makeAgent('agent-default', 'engineering')] });
+    expect(await scheduler.tick({ workflowId: task.workflowId, capacity: 1, workerId: 'new' })).toHaveLength(1);
+    expect(launcher.calls[0].sessionId).toBe('session:dispatch:recovered-dispatch:v3');
+  });
+
+  it('enforces one agent slot across concurrently ticking workflows', async () => {
+    const first = makeTask('workflow-a', { workflowId: workflowId('workflow-a') });
+    const second = makeTask('workflow-b', { workflowId: workflowId('workflow-b') });
+    const repository = new InMemoryTaskRepository();
+    await seed(repository, [first, second]);
+    const claims = new InMemoryDispatchClaimStore(repository);
+    const outbox = new InMemoryOutbox({ now: () => now });
+    const persistence = new TestTransactionalPersistence(repository, outbox, claims);
+    const launcher = new TestLauncher();
+    const scheduler = new TaskScheduler({ taskRepository: repository, transactionalPersistence: persistence,
+      outbox, launcher, clock: new TestClock(), agentDefinitions: [makeAgent('agent-default', 'engineering', { maxConcurrency: 1 })] });
+    const [a, b] = await Promise.all([
+      scheduler.tick({ workflowId: first.workflowId, capacity: 1, workerId: 'a' }),
+      scheduler.tick({ workflowId: second.workflowId, capacity: 1, workerId: 'b' })
+    ]);
+    expect(a.length + b.length).toBe(1);
+  });
   it('dispatches exactly 50 of 60 ready tasks and later dispatches the ten remaining tasks', async () => {
     const tasks = Array.from({ length: 60 }, (_, index) => makeTask(`task-${index.toString().padStart(2, '0')}`));
     const launcher = new TestLauncher();
@@ -300,7 +373,7 @@ describe('scheduler dispatch', () => {
         idempotencyKey: launcher.calls[0].idempotencyKey
       }
     });
-    expect(launcher.calls[0].sessionId).toBe(agentSessionId(`session:dispatch:${task.id}`));
+    expect(launcher.calls[0].sessionId).toBe(agentSessionId(`session:dispatch:${task.id}:v1`));
     expect(launcher.calls[0].idempotencyKey).toBe(launcher.calls[0].sessionId);
   });
 
@@ -403,6 +476,9 @@ describe('scheduler dispatch', () => {
         await base.saveTaskAndAppend(input);
       },
       claimDispatch: (input) => base.claimDispatch(input),
+      getDispatchClaim: (id) => base.getDispatchClaim(id),
+      beginDispatchCleanup: (id, worker, lease, generation) => base.beginDispatchCleanup(id, worker, lease, generation),
+      abortDispatchCleanup: (id, worker, lease, generation) => base.abortDispatchCleanup(id, worker, lease, generation),
       releaseDispatch: (id, worker, lease) => base.releaseDispatch(id, worker, lease)
     };
     const launcher = new TestLauncher();
@@ -452,6 +528,9 @@ describe('scheduler dispatch', () => {
         await base.saveTaskAndAppend(input);
       },
       claimDispatch: (input) => base.claimDispatch(input),
+      getDispatchClaim: (id) => base.getDispatchClaim(id),
+      beginDispatchCleanup: (id, worker, lease, generation) => base.beginDispatchCleanup(id, worker, lease, generation),
+      abortDispatchCleanup: (id, worker, lease, generation) => base.abortDispatchCleanup(id, worker, lease, generation),
       releaseDispatch: (id, worker, lease) => base.releaseDispatch(id, worker, lease)
     };
     const launcher = new TestLauncher();
@@ -467,7 +546,7 @@ describe('scheduler dispatch', () => {
       leaseId: 'new-id', now: now, expiresAt: new Date(now.getTime() + 1000)
     });
     expect(claim).toBeNull();
-    expect(launcher.stops).toEqual([`session:dispatch:${task.id}`]);
+    expect(launcher.stops).toEqual([`session:dispatch:${task.id}:v1`]);
   });
 
   it('checks worker ownership when releasing a claim', async () => {

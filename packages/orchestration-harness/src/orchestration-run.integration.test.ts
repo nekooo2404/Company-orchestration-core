@@ -23,5 +23,9 @@ describe('fifty-agent orchestration scenario', () => {
     expect(result.agentEvidence.checkpointIds).toContain('checkpoint:scenario-task-60:validated');
     expect(result.agentEvidence.evidenceIds).toHaveLength(60);
     expect(result.agentEvidence.evidenceIds).toContain('evidence:scenario-task-60:validated');
+    expect(result.persistedEvidence).toEqual({
+      checkpointCount: 60, progressMessageCount: 120, artifactReferenceCount: 60,
+      testRequestCount: 60, reviewEventCount: 60
+    });
   });
 });

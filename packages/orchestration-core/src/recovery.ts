@@ -7,13 +7,14 @@ import {
   type ActorRef,
   type ApprovalRecord,
   type CorrelationId,
+  type DomainEvent,
   type Task,
   type TaskId
 } from '@aicompany/contracts';
-import { failureFingerprint } from './failure-fingerprint';
-import type { TransactionalPersistence } from './ports';
-import type { TaskRepository } from './repository';
-import { transitionTask } from './task-state-machine';
+import { failureFingerprint } from './failure-fingerprint.js';
+import type { TransactionalPersistence } from './ports.js';
+import type { TaskRepository } from './repository.js';
+import { transitionTask } from './task-state-machine.js';
 
 export interface FailureContext {
   taskId: TaskId;
@@ -47,6 +48,8 @@ export interface RecoveryRecord {
   state: 'STARTED' | 'SUCCEEDED' | 'FAILED' | 'ESCALATED';
   createdAt: Date;
   evidenceIds: string[];
+  startFingerprint?: string;
+  completionFingerprint?: string;
 }
 
 export interface RecoveryCompletion {
@@ -69,6 +72,10 @@ export interface RecoveryCoordinator {
   start(input: RecoveryRequest): Promise<RecoveryRecord>;
   complete(input: RecoveryCompletion): Promise<void>;
   escalate(input: EscalationRequest): Promise<ApprovalRecord>;
+}
+
+export interface RecoveryEventConsumer {
+  handleTaskEvent(event: DomainEvent, failure?: FailureContext): Promise<RecoveryRecord | null>;
 }
 
 export interface RecoveryStrategy {
@@ -105,6 +112,11 @@ export class InMemoryRecoveryRecordStore implements RecoveryRecordStore {
     }
     this.records.set(record.recoveryId, structuredClone(record));
   }
+  public snapshot(): Map<string, RecoveryRecord> { return structuredClone(this.records); }
+  public restore(snapshot: Map<string, RecoveryRecord>): void {
+    this.records.clear();
+    for (const [id, record] of snapshot) this.records.set(id, structuredClone(record));
+  }
 }
 
 export interface RecoveryCoordinatorOptions {
@@ -120,11 +132,36 @@ export interface RecoveryCoordinatorOptions {
 const SYSTEM_ACTOR: ActorRef = { kind: 'SYSTEM', name: 'recovery-coordinator' };
 const cloneRecord = (record: RecoveryRecord): RecoveryRecord => structuredClone(record);
 
-export class RecoveryCoordinatorService implements RecoveryCoordinator {
+export class RecoveryCoordinatorService implements RecoveryCoordinator, RecoveryEventConsumer {
   private readonly now: () => Date;
 
   public constructor(private readonly options: RecoveryCoordinatorOptions) {
     this.now = options.now ?? (() => new Date());
+  }
+
+  public async handleTaskEvent(event: DomainEvent, failure?: FailureContext): Promise<RecoveryRecord | null> {
+    if (event.aggregateType !== 'TASK' || (event.eventType !== 'BLOCKED' && event.eventType !== 'TASK_FAILED')) {
+      return null;
+    }
+    const taskId = TaskIdSchema.parse(event.aggregateId);
+    const message = event.eventType === 'BLOCKED'
+      ? event.payload.reason
+      : event.payload.failureFingerprint;
+    const derivedFailure: FailureContext = {
+      taskId,
+      attemptId: failure?.attemptId ?? event.eventId,
+      errorClass: failure?.errorClass ?? (event.eventType === 'BLOCKED' ? 'TaskBlocked' : 'TaskFailed'),
+      commandName: failure?.commandName ?? event.eventType,
+      ...(failure?.exitCode === undefined ? {} : { exitCode: failure.exitCode }),
+      message: failure?.message ?? message,
+      evidenceIds: [...(failure?.evidenceIds ?? [])]
+    };
+    return this.start({
+      taskId,
+      failure: derivedFailure,
+      actor: event.actor,
+      correlationId: event.correlationId
+    });
   }
 
   public async start(input: RecoveryRequest): Promise<RecoveryRecord> {
@@ -134,12 +171,17 @@ export class RecoveryCoordinatorService implements RecoveryCoordinator {
       throw new Error('Recovery request task ID does not match failure task ID');
     }
     const task = await this.requireTask(taskId);
+    const fingerprint = failureFingerprint(input.failure);
+    const currentRecoveryId = this.options.newRecoveryId?.(task.recoveryCycles, taskId) ?? `recovery:${taskId}:cycle:${task.recoveryCycles}`;
+    const priorRecord = await this.options.records.get(currentRecoveryId);
+    const startFingerprint = JSON.stringify({ taskId, fingerprint, attemptId: input.failure.attemptId,
+      actor: input.actor, correlationId: correlation });
+    if (task.state === 'RECOVERING' && priorRecord?.startFingerprint === startFingerprint) return cloneRecord(priorRecord);
     if (task.state !== 'BLOCKED' && task.state !== 'FAILED') {
       throw new Error(`Cannot start recovery for task in ${task.state}`);
     }
     if (task.recoveryCycles >= 5) throw new Error('Maximum recovery cycles have been exhausted');
 
-    const fingerprint = failureFingerprint(input.failure);
     const history = await this.options.records.list(taskId);
     const previous = history.at(-1);
     const strategy = this.selectStrategy(input.failure, previous?.fingerprint === fingerprint ? previous.plan.strategyName : undefined);
@@ -159,19 +201,22 @@ export class RecoveryCoordinatorService implements RecoveryCoordinator {
       correlationId: correlation,
       causationId: recovery.event.eventId
     };
-    await this.options.transactionalPersistence.saveTaskAndAppend({
-      task: recovery.task, expectedVersion: task.version, events: [recovery.event], commands: [command]
-    });
     const record: RecoveryRecord = {
       recoveryId, taskId, cycle, fingerprint, plan: strategy.plan(input.failure),
-      state: 'STARTED', createdAt: now, evidenceIds: [...new Set(input.failure.evidenceIds)]
+      state: 'STARTED', createdAt: now, evidenceIds: [...new Set(input.failure.evidenceIds)], startFingerprint
     };
-    await this.options.records.save(record);
+    await this.options.transactionalPersistence.saveRecoveryAndAppend({
+      task: recovery.task, expectedVersion: task.version, events: [recovery.event], commands: [command],
+      record, idempotencyKey: `recovery-start:${recoveryId}`, requestFingerprint: startFingerprint
+    });
     return cloneRecord(record);
   }
 
   public async complete(input: RecoveryCompletion): Promise<void> {
     const record = await this.options.records.get(input.recoveryId);
+    const completionFingerprint = JSON.stringify({ recoveryId: input.recoveryId, taskId: input.taskId,
+      succeeded: input.succeeded, evidenceIds: [...new Set(input.evidenceIds)].sort() });
+    if (record?.completionFingerprint === completionFingerprint) return;
     if (record === null || record.taskId !== input.taskId || record.state !== 'STARTED') {
       throw new Error('Recovery completion does not identify a started recovery');
     }
@@ -184,30 +229,31 @@ export class RecoveryCoordinatorService implements RecoveryCoordinator {
       const ready = transitionTask(task, { type: 'TASK_READY' }, {
         actor: SYSTEM_ACTOR, now: this.now(), evidenceIds, isDeployment: task.isDeployment ?? false
       });
-      await this.options.transactionalPersistence.saveTaskAndAppend({
-        task: ready.task, expectedVersion: task.version, events: [ready.event], commands: []
+      await this.options.transactionalPersistence.saveRecoveryAndAppend({
+        task: ready.task, expectedVersion: task.version, events: [ready.event], commands: [],
+        record: { ...record, state: 'SUCCEEDED', evidenceIds, completionFingerprint },
+        idempotencyKey: `recovery-complete:${record.recoveryId}`, requestFingerprint: completionFingerprint
       });
-      await this.options.records.save({ ...record, state: 'SUCCEEDED', evidenceIds });
       return;
     }
     if (record.cycle === 5) {
       await this.escalate({
         taskId: task.id, reason: `Recovery cycle 5 failed (${record.fingerprint})`,
         recoveryId: record.recoveryId, actor: SYSTEM_ACTOR, correlationId: task.traceId, evidenceIds
-      });
-      await this.options.records.save({ ...record, state: 'ESCALATED', evidenceIds });
+      }, completionFingerprint);
       return;
     }
     const failed = transitionTask(task, { type: 'TASK_FAILED', failureFingerprint: record.fingerprint }, {
       actor: SYSTEM_ACTOR, now: this.now(), evidenceIds, isDeployment: task.isDeployment ?? false
     });
-    await this.options.transactionalPersistence.saveTaskAndAppend({
-      task: failed.task, expectedVersion: task.version, events: [failed.event], commands: []
+    await this.options.transactionalPersistence.saveRecoveryAndAppend({
+      task: failed.task, expectedVersion: task.version, events: [failed.event], commands: [],
+      record: { ...record, state: 'FAILED', evidenceIds, completionFingerprint },
+      idempotencyKey: `recovery-complete:${record.recoveryId}`, requestFingerprint: completionFingerprint
     });
-    await this.options.records.save({ ...record, state: 'FAILED', evidenceIds });
   }
 
-  public async escalate(input: EscalationRequest): Promise<ApprovalRecord> {
+  public async escalate(input: EscalationRequest, completionFingerprint?: string): Promise<ApprovalRecord> {
     const task = await this.requireTask(TaskIdSchema.parse(input.taskId));
     if (task.state !== 'RECOVERING' || task.recoveryCycles !== 5) {
       throw new Error('Recovery escalation is only valid after the fifth recovery cycle');
@@ -233,8 +279,14 @@ export class RecoveryCoordinatorService implements RecoveryCoordinator {
       actor: input.actor, issuedAt: now, availableAt: now,
       correlationId: approval.correlationId, causationId: transition.event.eventId
     };
-    await this.options.transactionalPersistence.saveTaskAndAppend({
-      task: transition.task, expectedVersion: task.version, events: [transition.event], commands: [command]
+    const record = await this.options.records.get(input.recoveryId);
+    if (!record || record.taskId !== task.id || record.state !== 'STARTED') throw new Error('Escalation requires a started recovery record');
+    const fingerprint = completionFingerprint ?? JSON.stringify({ recoveryId: input.recoveryId, reason: input.reason,
+      evidenceIds: [...evidenceIds].sort() });
+    await this.options.transactionalPersistence.saveRecoveryAndAppend({
+      task: transition.task, expectedVersion: task.version, events: [transition.event], commands: [command],
+      record: { ...record, state: 'ESCALATED', evidenceIds, completionFingerprint: fingerprint },
+      idempotencyKey: `recovery-complete:${record.recoveryId}`, requestFingerprint: fingerprint
     });
     return approval;
   }

@@ -7,10 +7,10 @@ import {
   type OutboxCommand,
   type Task
 } from '@aicompany/contracts';
-import { OptimisticConcurrencyError } from './repository';
-import type { AgentCheckpoint } from './checkpoints';
-import type { InMemoryTaskRepository } from './test-support/inmemory-store';
-import type { CheckpointStore } from './checkpoints';
+import { OptimisticConcurrencyError } from './repository.js';
+import type { AgentCheckpoint } from './checkpoints.js';
+import type { InMemoryTaskRepository } from './test-support/inmemory-store.js';
+import type { CheckpointStore } from './checkpoints.js';
 
 export interface AgentSessionRepository {
   get(sessionId: AgentSessionId): Promise<AgentSession | null>;
@@ -88,10 +88,10 @@ export interface WorkflowStatusReader {
 }
 
 export interface SessionLifecyclePersistence {
-  start(input: { task: Task; expectedTaskVersion: number; session: AgentSession; expectedSessionVersion: 0; event: DomainEvent; command: OutboxCommand; idempotencyKey: string; requestFingerprint: string }): Promise<void>;
+  start(input: { task: Task; expectedTaskVersion: number; session: AgentSession; expectedSessionVersion: 0; taskEvent: DomainEvent; event: DomainEvent; command: OutboxCommand; idempotencyKey: string; requestFingerprint: string }): Promise<void>;
   checkpoint(input: { checkpoint: AgentCheckpoint; session: AgentSession; expectedSessionVersion: number; event: DomainEvent; idempotencyKey: string; requestFingerprint: string }): Promise<void>;
   transition(input: { session: AgentSession; expectedSessionVersion: number; event: DomainEvent; command: OutboxCommand | null; expectedTaskVersion: number | null; idempotencyKey: string; requestFingerprint: string }): Promise<void>;
-  cancel(input: { task: Task; expectedTaskVersion: number; session: AgentSession; expectedSessionVersion: number; event: DomainEvent; idempotencyKey: string; requestFingerprint: string }): Promise<void>;
+  cancel(input: { task: Task; expectedTaskVersion: number; session: AgentSession; expectedSessionVersion: number; taskEvent: DomainEvent; event: DomainEvent; idempotencyKey: string; requestFingerprint: string }): Promise<void>;
   operationFingerprint(idempotencyKey: string): string | null;
   requestFingerprint(idempotencyKey: string): string | null;
   operationResult(idempotencyKey: string): { sessionId: AgentSessionId; version: number; attempt: number } | null;
@@ -129,7 +129,7 @@ export class InMemorySessionLifecyclePersistence implements SessionLifecyclePers
         agentDefinitionId: input.command.payload.agentDefinitionId,
         correlationId: input.command.correlationId, expectedTaskVersion: input.expectedTaskVersion
       }));
-      this.append(input.event, input.command, input.idempotencyKey, input); this.sessions.restoreRequestFingerprint(input.idempotencyKey, input.requestFingerprint); this.options.failAt?.('event'); if (input.command) this.options.failAt?.('command');
+      this.append(input.event, input.command, input.idempotencyKey, input, input.taskEvent); this.sessions.restoreRequestFingerprint(input.idempotencyKey, input.requestFingerprint); this.options.failAt?.('event'); if (input.command) this.options.failAt?.('command');
     }, input.task.id, input.session.sessionId);
     });
   }
@@ -183,7 +183,7 @@ export class InMemorySessionLifecyclePersistence implements SessionLifecyclePers
     await this.atomic(input.idempotencyKey, async () => {
       await this.tasks.save(input.task, input.expectedTaskVersion); this.options.failAt?.('task');
       await this.sessions.save(input.session, input.expectedSessionVersion); this.options.failAt?.('session');
-      this.append(input.event, null, input.idempotencyKey, input); this.sessions.restoreRequestFingerprint(input.idempotencyKey, input.requestFingerprint); this.options.failAt?.('event');
+      this.append(input.event, null, input.idempotencyKey, input, input.taskEvent); this.sessions.restoreRequestFingerprint(input.idempotencyKey, input.requestFingerprint); this.options.failAt?.('event');
     }, input.task.id, input.session.sessionId);
     });
   }
@@ -219,8 +219,13 @@ export class InMemorySessionLifecyclePersistence implements SessionLifecyclePers
 
   private recordFingerprint(key: string, input: unknown): void { this.pendingFingerprint = this.fingerprint(input); this.pendingKey = key; }
 
-  private append(event: DomainEvent, command: OutboxCommand | null, key: string, input: unknown): void {
+  private append(event: DomainEvent, command: OutboxCommand | null, key: string, input: unknown, taskEvent?: DomainEvent): void {
     DomainEventSchema.parse(event);
+    if (taskEvent) {
+      DomainEventSchema.parse(taskEvent);
+      if (taskEvent.eventId === event.eventId) throw new Error('Task and session event IDs must differ');
+      this.events.push(globalThis.structuredClone(taskEvent));
+    }
     this.events.push(globalThis.structuredClone(event));
     if (command) this.commands.push(globalThis.structuredClone(command));
     if (this.pendingKey === key) this.operations.set(key, this.fingerprint(input));

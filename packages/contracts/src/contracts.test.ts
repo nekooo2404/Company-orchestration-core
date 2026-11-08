@@ -66,7 +66,7 @@ const validApproval = {
 const validCommand = {
   commandId: 'command-1',
   type: 'DEPLOY',
-  payload: { taskId: taskId('task-1'), approvalId: approvalId('approval-1') },
+  payload: { taskId: taskId('task-1'), approvalId: approvalId('approval-1'), attemptId: 'deploy:task-1:approval-1' },
   actor: { kind: 'SYSTEM', name: 'orchestrator' },
   issuedAt: now,
   availableAt: now,

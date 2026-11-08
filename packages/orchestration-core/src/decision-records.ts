@@ -7,7 +7,7 @@ import {
   type CorrelationId,
   type EventId
 } from '@aicompany/contracts';
-import { type ChannelAuthorization, type ChannelScope } from './channel-policy';
+import { type ChannelAuthorization, type ChannelScope } from './channel-policy.js';
 
 export interface RecordDecisionInput {
   actor: ActorRef;

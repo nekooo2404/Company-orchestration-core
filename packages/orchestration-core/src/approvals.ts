@@ -13,10 +13,10 @@ import {
   type DomainEvent,
   type OutboxCommand
 } from '@aicompany/contracts';
-import type { SaveApprovalDecisionAndTaskInput, SaveApprovalRequestInput, TransactionalPersistence } from './ports';
-import type { TaskRepository } from './repository';
-import { OptimisticConcurrencyError } from './repository';
-import { transitionTask } from './task-state-machine';
+import type { SaveApprovalDecisionAndTaskInput, SaveApprovalRequestInput, TransactionalPersistence } from './ports.js';
+import type { TaskRepository } from './repository.js';
+import { OptimisticConcurrencyError } from './repository.js';
+import { transitionTask } from './task-state-machine.js';
 
 export interface ApprovalRequest {
   subjectType: ApprovalRecord['subjectType'];
@@ -375,7 +375,8 @@ export class ApprovalServiceImpl implements ApprovalService {
         commands.push({
           commandId: `deploy:${task.id}:${next.approvalId}`,
           type: 'DEPLOY',
-          payload: { taskId: task.id, approvalId: next.approvalId },
+          payload: { taskId: task.id, approvalId: next.approvalId,
+            attemptId: task.deploymentAttemptId! },
           actor: input.actor,
           issuedAt: now,
           availableAt: now,

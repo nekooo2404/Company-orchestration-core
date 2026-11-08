@@ -15,9 +15,10 @@ import {
   DuplicatePersistenceIdError,
   InvalidPersistenceOperationError,
   OptimisticConcurrencyError
-} from '../repository';
-import type { DispatchClaim, DispatchClaimRequest, DispatchClaimStore, EventStore, Outbox, OutboxCommand, SaveApprovalDecisionAndTaskInput, SaveApprovalRequestInput, SaveTaskAndAppendInput, TaskRepository, TransactionalPersistence } from '../ports';
-import type { InMemoryApprovalStore } from '../approvals';
+} from '../repository.js';
+import type { DispatchClaim, DispatchClaimRequest, DispatchClaimStore, EventStore, Outbox, OutboxCommand, SaveApprovalDecisionAndTaskInput, SaveApprovalRequestInput, SaveTaskAndAppendInput, TaskRepository, TransactionalPersistence } from '../ports.js';
+import type { InMemoryApprovalStore } from '../approvals.js';
+import type { InMemoryRecoveryRecordStore } from '../recovery.js';
 
 const clone = <T>(value: T): T => globalThis.structuredClone(value);
 
@@ -218,26 +219,66 @@ export class InMemoryEventStore implements EventStore {
 
 export class InMemoryDispatchClaimStore implements DispatchClaimStore {
   private readonly claims = new Map<string, DispatchClaim>();
+  private transactionTail: Promise<void> = Promise.resolve();
 
   public constructor(private readonly tasks?: TaskRepository) {}
 
   public async claimDispatch(input: DispatchClaimRequest): Promise<DispatchClaim | null> {
+    return this.serialize(async () => {
     const workerId = canonicalId(input.workerId, 'workerId');
     const task = await this.tasks?.get(input.taskId);
     if (this.tasks !== undefined && (task === null || task?.state !== 'READY' || task.version !== input.taskVersion || input.taskState !== 'READY')) return null;
     const existing = this.claims.get(input.taskId);
-    if (existing !== undefined && existing.expiresAt > input.now) {
+    if (existing !== undefined && existing.taskVersion === input.taskVersion && (existing.expiresAt > input.now || existing.cleanupInProgress)) {
       return null;
     }
     if (
-      existing !== undefined &&
+      existing !== undefined && existing.taskVersion === input.taskVersion &&
       (existing.agentDefinitionId !== input.agentDefinitionId || existing.sessionId !== input.sessionId)
     ) return null;
-    const claim: DispatchClaim = existing === undefined
-      ? { ...clone(input), workerId }
-      : { ...clone(existing), workerId, expiresAt: clone(input.expiresAt), taskVersion: input.taskVersion, taskState: input.taskState };
+    if (input.maxConcurrency !== undefined) {
+      const running = await this.tasks?.countActiveByAgent(input.agentDefinitionId) ?? 0;
+      const candidates = [...this.claims.values()].filter((candidate) =>
+        candidate.taskId !== input.taskId && candidate.agentDefinitionId === input.agentDefinitionId &&
+        candidate.expiresAt > input.now && !candidate.cleanupInProgress
+      );
+      const pending = (await Promise.all(candidates.map(async (candidate) =>
+        (await this.tasks?.get(candidate.taskId))?.state === 'READY'
+      ))).filter(Boolean).length;
+      if (running + pending >= input.maxConcurrency) return null;
+    }
+    const reclaim = existing !== undefined && existing.taskVersion === input.taskVersion;
+    const claim: DispatchClaim = reclaim
+      ? { ...clone(existing), workerId, expiresAt: clone(input.expiresAt), generation: existing.generation + 1 }
+      : { ...clone(input), workerId, generation: (existing?.generation ?? 0) + 1, cleanupInProgress: false };
     this.claims.set(input.taskId, claim);
     return clone(claim);
+    });
+  }
+
+  public async beginDispatchCleanup(taskId: TaskId, workerId: string, leaseId: string, generation: number): Promise<boolean> {
+    return this.serialize(async () => {
+      const claim = this.claims.get(taskId);
+      const task = await this.tasks?.get(taskId);
+      if (!claim || claim.workerId !== workerId || claim.leaseId !== leaseId || claim.generation !== generation ||
+          claim.cleanupInProgress || (task && (task.state !== 'READY' || task.version !== claim.taskVersion))) return false;
+      this.claims.set(taskId, { ...claim, cleanupInProgress: true });
+      return true;
+    });
+  }
+
+  public async abortDispatchCleanup(taskId: TaskId, workerId: string, leaseId: string, generation: number): Promise<void> {
+    const claim = this.claims.get(taskId);
+    if (claim?.workerId === workerId && claim.leaseId === leaseId && claim.generation === generation) {
+      this.claims.set(taskId, { ...claim, cleanupInProgress: false });
+    }
+  }
+
+  public retire(taskId: TaskId): void { this.claims.delete(taskId); }
+  public snapshot(): Map<string, DispatchClaim> { return clone(this.claims); }
+  public restore(snapshot: Map<string, DispatchClaim>): void {
+    this.claims.clear();
+    for (const [id, claim] of snapshot) this.claims.set(id, clone(claim));
   }
 
   public async getDispatchClaim(taskId: TaskId): Promise<DispatchClaim | null> {
@@ -253,6 +294,14 @@ export class InMemoryDispatchClaimStore implements DispatchClaimStore {
     this.claims.delete(taskId);
     return true;
   }
+
+  private async serialize<T>(operation: () => Promise<T>): Promise<T> {
+    const previous = this.transactionTail;
+    let release!: () => void;
+    this.transactionTail = new Promise<void>((resolve) => { release = resolve; });
+    await previous;
+    try { return await operation(); } finally { release(); }
+  }
 }
 
 export class InMemoryTransactionalPersistence implements TransactionalPersistence {
@@ -263,6 +312,11 @@ export class InMemoryTransactionalPersistence implements TransactionalPersistenc
 
   public saveTaskAndAppend(input: SaveTaskAndAppendInput): Promise<void> {
     return this.persistence.saveTaskAndAppend(input);
+  }
+  public saveRecoveryAndAppend(input: SaveTaskAndAppendInput & { record: import('../recovery').RecoveryRecord; idempotencyKey: string; requestFingerprint: string }): Promise<void> {
+    const recovery = this.persistence as Partial<TransactionalPersistence>;
+    if (!recovery.saveRecoveryAndAppend) throw new InvalidPersistenceOperationError('Atomic recovery persistence is not configured');
+    return recovery.saveRecoveryAndAppend(input);
   }
 
   public async saveApprovalDecisionAndTask(input: SaveApprovalDecisionAndTaskInput): Promise<void> {
@@ -277,6 +331,14 @@ export class InMemoryTransactionalPersistence implements TransactionalPersistenc
 
   public claimDispatch(input: DispatchClaimRequest): Promise<DispatchClaim | null> {
     return this.claims.claimDispatch(input);
+  }
+
+  public getDispatchClaim(taskId: TaskId): Promise<DispatchClaim | null> { return this.claims.getDispatchClaim(taskId); }
+  public beginDispatchCleanup(taskId: TaskId, workerId: string, leaseId: string, generation: number): Promise<boolean> {
+    return this.claims.beginDispatchCleanup(taskId, workerId, leaseId, generation);
+  }
+  public abortDispatchCleanup(taskId: TaskId, workerId: string, leaseId: string, generation: number): Promise<void> {
+    return this.claims.abortDispatchCleanup(taskId, workerId, leaseId, generation);
   }
 
   public releaseDispatch(taskId: TaskId, workerId: string, leaseId: string): Promise<boolean> {
@@ -298,6 +360,10 @@ export class InMemoryTaskRepository implements TaskRepository {
       .filter((task) => task.workflowId === parsedWorkflowId)
       .sort((left, right) => left.id.localeCompare(right.id))
       .map(clone);
+  }
+
+  public async countActiveByAgent(agentId: NonNullable<Task['ownerAgentDefinitionId']>): Promise<number> {
+    return [...this.tasks.values()].filter((task) => task.ownerAgentDefinitionId === agentId && task.state === 'RUNNING').length;
   }
 
   public async save(task: Task, expectedVersion: number): Promise<void> {
@@ -422,6 +488,14 @@ export class InMemoryOutbox implements Outbox {
     this.commands.clear();
     for (const [commandId, command] of snapshot.entries()) this.commands.set(commandId, clone(command));
   }
+
+  public retireStartsForTask(taskId: TaskId): void {
+    for (const [id, command] of this.commands) {
+      if (command.type === 'START_AGENT_SESSION' && command.payload.taskId === taskId && !command.completedAt) {
+        this.commands.set(id, { ...command, completedAt: clone(this.now()) });
+      }
+    }
+  }
 }
 
 export type InMemoryApprovalFailurePoint =
@@ -432,32 +506,98 @@ export type InMemoryApprovalFailurePoint =
   | 'after-task'
   | 'after-approval-event'
   | 'after-task-event'
-  | 'after-outbox';
+  | 'after-outbox'
+  | 'after-recovery-task'
+  | 'after-recovery-record';
 
 export interface InMemoryApprovalTransactionalPersistenceOptions {
   tasks: InMemoryTaskRepository;
   events: InMemoryEventStore;
   outbox: InMemoryOutbox;
   approvals: InMemoryApprovalStore;
-  claims?: DispatchClaimStore;
+  records?: InMemoryRecoveryRecordStore;
+  claims?: InMemoryDispatchClaimStore;
   failAfter?: InMemoryApprovalFailurePoint;
 }
 
 export class InMemoryApprovalTransactionalPersistence implements TransactionalPersistence {
-  private readonly claims: DispatchClaimStore;
+  private readonly claims: InMemoryDispatchClaimStore;
   private readonly operations = new Map<string, string>();
+  private transactionTail: Promise<void> = Promise.resolve();
 
   public constructor(private readonly options: InMemoryApprovalTransactionalPersistenceOptions) {
     this.claims = options.claims ?? new InMemoryDispatchClaimStore(options.tasks);
   }
 
   public async saveTaskAndAppend(input: SaveTaskAndAppendInput): Promise<void> {
+    return this.serialize(() => this.atomicTask(input));
+  }
+
+  public async saveRecoveryAndAppend(input: SaveTaskAndAppendInput & {
+    record: import('../recovery').RecoveryRecord; idempotencyKey: string; requestFingerprint: string
+  }): Promise<void> {
+    return this.serialize(async () => {
+      const existing = this.operations.get(input.idempotencyKey);
+      if (existing !== undefined) {
+        if (existing !== input.requestFingerprint) throw new InvalidPersistenceOperationError('Recovery idempotency key reused with different data');
+        return;
+      }
+      if (!this.options.records) throw new InvalidPersistenceOperationError('Atomic recovery record store is not configured');
+      const task = this.options.tasks.snapshot(input.task.id);
+      const events = this.options.events.snapshot();
+      const outbox = this.options.outbox.snapshot();
+      const records = this.options.records.snapshot();
+      const claims = this.claims.snapshot();
+      try {
+        await this.writeTask(input);
+        this.failIf('after-recovery-task');
+        if (input.record.state === 'SUCCEEDED' && input.task.state === 'READY') {
+          this.claims.retire(input.task.id);
+          this.options.outbox.retireStartsForTask(input.task.id);
+        }
+        await this.options.records.save(input.record);
+        this.failIf('after-recovery-record');
+        this.operations.set(input.idempotencyKey, input.requestFingerprint);
+      } catch (error) {
+        this.options.tasks.restore(input.task.id, task);
+        this.options.events.restore(events);
+        this.options.outbox.restore(outbox);
+        this.options.records.restore(records);
+        this.claims.restore(claims);
+        throw error;
+      }
+    });
+  }
+
+  private async atomicTask(input: SaveTaskAndAppendInput): Promise<void> {
+    const task = this.options.tasks.snapshot(input.task.id);
+    const events = this.options.events.snapshot();
+    const outbox = this.options.outbox.snapshot();
+    try { await this.writeTask(input); }
+    catch (error) {
+      this.options.tasks.restore(input.task.id, task);
+      this.options.events.restore(events);
+      this.options.outbox.restore(outbox);
+      throw error;
+    }
+  }
+
+  private async writeTask(input: SaveTaskAndAppendInput): Promise<void> {
     await this.options.tasks.save(input.task, input.expectedVersion);
     await this.options.events.append(input.events, input.expectedVersion);
     for (const command of input.commands) await this.options.outbox.enqueue(command);
   }
 
+  private async serialize<T>(operation: () => Promise<T>): Promise<T> {
+    const prior = this.transactionTail;
+    let release!: () => void;
+    this.transactionTail = new Promise<void>((resolve) => { release = resolve; });
+    await prior;
+    try { return await operation(); } finally { release(); }
+  }
+
   public async saveApprovalRequest(input: SaveApprovalRequestInput): Promise<import('@aicompany/contracts').ApprovalRecord> {
+    return this.serialize(async () => {
     const prior = await this.options.approvals.findByIdempotencyKey(input.idempotencyKey);
     if (prior !== null) {
       if (prior.fingerprint !== input.requestFingerprint) {
@@ -491,9 +631,11 @@ export class InMemoryApprovalTransactionalPersistence implements TransactionalPe
       this.options.outbox.restore(outboxSnapshot);
       throw error;
     }
+    });
   }
 
   public async saveApprovalDecisionAndTask(input: SaveApprovalDecisionAndTaskInput): Promise<void> {
+    return this.serialize(async () => {
     const priorFingerprint = this.operations.get(input.idempotencyKey);
     if (priorFingerprint !== undefined) {
       if (priorFingerprint !== input.requestFingerprint) {
@@ -540,14 +682,23 @@ export class InMemoryApprovalTransactionalPersistence implements TransactionalPe
       if (input.task !== undefined) this.options.tasks.restore(input.task.id, taskSnapshot);
       throw error;
     }
+    });
   }
 
   public claimDispatch(input: DispatchClaimRequest): Promise<DispatchClaim | null> {
-    return this.claims.claimDispatch(input);
+    return this.serialize(() => this.claims.claimDispatch(input));
+  }
+
+  public getDispatchClaim(taskId: TaskId): Promise<DispatchClaim | null> { return this.claims.getDispatchClaim(taskId); }
+  public beginDispatchCleanup(taskId: TaskId, workerId: string, leaseId: string, generation: number): Promise<boolean> {
+    return this.serialize(() => this.claims.beginDispatchCleanup(taskId, workerId, leaseId, generation));
+  }
+  public abortDispatchCleanup(taskId: TaskId, workerId: string, leaseId: string, generation: number): Promise<void> {
+    return this.serialize(() => this.claims.abortDispatchCleanup(taskId, workerId, leaseId, generation));
   }
 
   public releaseDispatch(taskId: TaskId, workerId: string, leaseId: string): Promise<boolean> {
-    return this.claims.releaseDispatch(taskId, workerId, leaseId);
+    return this.serialize(() => this.claims.releaseDispatch(taskId, workerId, leaseId));
   }
 
   private failIf(point: InMemoryApprovalFailurePoint): void {

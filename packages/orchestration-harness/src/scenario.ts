@@ -3,6 +3,7 @@ import {
   agentSessionId,
   approvalId,
   correlationId,
+  eventId,
   taskId,
   workflowId,
   type ApprovalId,
@@ -11,6 +12,12 @@ import {
 } from '@aicompany/contracts';
 import {
   ApprovalServiceImpl,
+  DeploymentResultRecorder,
+  InMemoryChannelAuthorization,
+  InMemoryCheckpointStore,
+  InMemoryCommunicationService,
+  InMemoryDomainEventPublisher,
+  InMemoryMessageStore,
   InMemoryApprovalStore,
   InMemoryApprovalTransactionalPersistence,
   InMemoryCostSink,
@@ -26,8 +33,8 @@ import {
   transitionTask
 } from '@aicompany/orchestration-core';
 import type { RecoveryPlan } from '@aicompany/orchestration-core';
-import { SimulatedAgent } from './simulated-agent';
-import type { SimulatedAgentResult } from './simulated-agent';
+import { SimulatedAgent } from './simulated-agent.js';
+import type { SimulatedAgentResult } from './simulated-agent.js';
 
 const fixedTime = new Date('2026-11-08T00:00:00.000Z');
 const departments = ['Product', 'Architecture', 'Development', 'Review', 'QA', 'Security', 'DevOps'] as const;
@@ -54,6 +61,13 @@ export interface ScenarioResult {
     testRequestCount: number;
     checkpointIds: string[];
     evidenceIds: string[];
+  };
+  persistedEvidence: {
+    checkpointCount: number;
+    progressMessageCount: number;
+    artifactReferenceCount: number;
+    testRequestCount: number;
+    reviewEventCount: number;
   };
 }
 
@@ -95,8 +109,8 @@ const createHarness = (): Harness => {
   const events = new InMemoryEventStore();
   const outbox = new InMemoryOutbox({ now: () => new Date(fixedTime) });
   const approvals = new InMemoryApprovalStore();
-  const persistence = new InMemoryApprovalTransactionalPersistence({ tasks, events, outbox, approvals });
   const recoveryRecords = new InMemoryRecoveryRecordStore();
+  const persistence = new InMemoryApprovalTransactionalPersistence({ tasks, events, outbox, approvals, records: recoveryRecords });
   const recovery = new RecoveryCoordinatorService({
     taskRepository: tasks,
     transactionalPersistence: persistence,
@@ -130,10 +144,8 @@ const makeTask = (id: TaskId, workflow: Task['workflowId'], index: number, deplo
   ...(deployment ? { isDeployment: true } : {})
 });
 
-const saveTransition = async (harness: Harness, task: Task, type: 'TASK_COMPLETED' | 'DEPLOYMENT_RESULT_RECORDED', evidenceIds: string[]): Promise<Task> => {
-  const result = transitionTask(task, type === 'TASK_COMPLETED'
-    ? { type, evidenceIds }
-    : { type, evidenceIds }, {
+const saveTransition = async (harness: Harness, task: Task, evidenceIds: string[]): Promise<Task> => {
+  const result = transitionTask(task, { type: 'TASK_COMPLETED', evidenceIds }, {
     actor, now: harness.clock.now(), evidenceIds, isDeployment: task.isDeployment ?? false
   });
   await harness.persistence.saveTaskAndAppend({ task: result.task, expectedVersion: task.version, events: [result.event], commands: [] });
@@ -207,14 +219,43 @@ export async function runFiftyAgentScenario(): Promise<ScenarioResult> {
   const trace = new InMemoryTraceSink(harness.clock.now);
   const metrics = new InMemoryMetricsSink();
   const costs = new InMemoryCostSink();
-  const evidenceCollection: SimulatedAgentResult[] = [];
-  const execute = (task: Task, department: string): SimulatedAgentResult => {
-    const result = agent.execute(task, department);
-    evidenceCollection.push(structuredClone(result));
-    return result;
-  };
   const generated = Array.from({ length: 60 }, (_, index) => makeTask(taskId(`scenario-task-${String(index + 1).padStart(2, '0')}`), workflow, index, index === 59));
   for (const task of generated) await harness.tasks.save(task, 0);
+  const checkpoints = new InMemoryCheckpointStore();
+  const messages = new InMemoryMessageStore();
+  const authorization = new InMemoryChannelAuthorization({
+    tasks: generated.map((task) => ({ taskId: task.id, projectId: task.projectId,
+      assignee: { kind: 'AGENT' as const, sessionId: agentSessionId(`session:dispatch:${task.id}:v1`) },
+      supervisors: [], invited: [] })),
+    projectAssignments: [], cancelledSessions: []
+  });
+  let messageNumber = 0;
+  const communication = new InMemoryCommunicationService(messages, authorization,
+    new InMemoryDomainEventPublisher(), { newMessageId: () => `message:${++messageNumber}`,
+      reader: () => actor, now: harness.clock.now });
+  const execute = async (task: Task, department: string): Promise<SimulatedAgentResult> => {
+    const result = agent.execute(task, department);
+    const sessionId = agent.sessionIdFor(task);
+    await checkpoints.save({ sessionId, taskId: task.id, sequence: 1, state: 'COMPLETED',
+      contextReference: result.checkpoint, lastEventId: eventId(`task:${task.id}:v${task.version}`),
+      completedOperationKeys: [`simulated:${task.id}:artifact`], createdAt: harness.clock.now() });
+    for (const [index] of result.progress.entries()) {
+      await communication.sendMessage({ actor: { kind: 'AGENT', sessionId },
+        scope: { kind: 'task', taskId: task.id }, messageType: 'PROGRESS',
+        contentReference: `progress://${task.id}/${index}`, correlationId: task.traceId,
+        causationId: eventId(`task:${task.id}:progress:${index}`) });
+    }
+    for (const [kind, reference] of [
+      ['artifact', `artifact://${result.artifact.artifactId}`],
+      ['test', `check://test/${task.id}`]
+    ] as const) {
+      await communication.sendMessage({ actor: { kind: 'AGENT', sessionId },
+        scope: { kind: 'task', taskId: task.id }, messageType: 'HANDOFF',
+        contentReference: reference, correlationId: task.traceId,
+        causationId: eventId(`task:${task.id}:${kind}`) });
+    }
+    return result;
+  };
 
   const scheduler = createScheduler(harness, agent);
   const first = await scheduler.tick({ workflowId: workflow, capacity: 50, workerId: 'simulated-worker' });
@@ -224,7 +265,7 @@ export async function runFiftyAgentScenario(): Promise<ScenarioResult> {
     if (task === null) throw new Error('Dispatched task disappeared');
     if (task.isDeployment) continue;
     const span = trace.startSpan({ name: 'simulated-agent-task', workflowId: workflow, taskId: task.id, correlationId: task.traceId, attributes: { department: task.title?.split(' ')[0] ?? 'unknown' } });
-    const result = execute(task, task.title?.split(' ')[0] ?? 'Development');
+    const result = await execute(task, task.title?.split(' ')[0] ?? 'Development');
     const started = transitionTask(task, { type: 'TASK_REVIEW_REQUESTED' }, { actor, now: harness.clock.now(), evidenceIds: result.evidenceIds, isDeployment: false });
     await harness.persistence.saveTaskAndAppend({ task: started.task, expectedVersion: task.version, events: [started.event], commands: [] });
     const review = transitionTask(started.task, { type: 'TASK_COMPLETED', evidenceIds: result.evidenceIds }, { actor, now: harness.clock.now(), evidenceIds: result.evidenceIds, isDeployment: false });
@@ -242,7 +283,7 @@ export async function runFiftyAgentScenario(): Promise<ScenarioResult> {
   for (const decision of second) {
     if (decision.taskId === deploymentDecision.taskId) continue;
     const task = (await harness.tasks.get(decision.taskId))!;
-    const result = execute(task, task.title?.split(' ')[0] ?? 'Development');
+    const result = await execute(task, task.title?.split(' ')[0] ?? 'Development');
     const review = transitionTask(task, { type: 'TASK_REVIEW_REQUESTED' }, { actor, now: harness.clock.now(), evidenceIds: result.evidenceIds, isDeployment: false });
     await harness.persistence.saveTaskAndAppend({ task: review.task, expectedVersion: task.version, events: [review.event], commands: [] });
     const complete = transitionTask(review.task, { type: 'TASK_COMPLETED', evidenceIds: result.evidenceIds }, { actor, now: harness.clock.now(), evidenceIds: result.evidenceIds, isDeployment: false });
@@ -252,11 +293,11 @@ export async function runFiftyAgentScenario(): Promise<ScenarioResult> {
   }
   const deploymentTask = await harness.tasks.get(deploymentDecision.taskId);
   if (deploymentTask === null) throw new Error('Deployment task disappeared');
-  const deploymentResult = execute(deploymentTask, 'DevOps');
+  const deploymentResult = await execute(deploymentTask, 'DevOps');
   await costs.recordUsage({ usageId: `usage:${deploymentTask.id}`, workflowId: workflow, taskId: deploymentTask.id, agentSessionId: agent.sessionIdFor(deploymentTask), agentDefinitionId: agentDefinitionId('agent:devops'), department: 'DevOps', provider: 'fake', baseUrlIdentifier: 'in-memory', model: 'simulated-deterministic', inputTokens: 100, outputTokens: 50, estimatedCostUsd: 0.001, createdAt: harness.clock.now() });
   const reviewTask = transitionTask(deploymentTask, { type: 'TASK_REVIEW_REQUESTED' }, { actor, now: harness.clock.now(), evidenceIds: deploymentResult.evidenceIds, isDeployment: true });
   await harness.persistence.saveTaskAndAppend({ task: reviewTask.task, expectedVersion: deploymentTask.version, events: [reviewTask.event], commands: [] });
-  const waiting = await saveTransition(harness, reviewTask.task, 'TASK_COMPLETED', deploymentResult.evidenceIds);
+  const waiting = await saveTransition(harness, reviewTask.task, deploymentResult.evidenceIds);
   const deploymentApprovalId = approvalId(`harness-deployment:${waiting.id}`);
   const approvalService = new ApprovalServiceImpl({
     approvals: harness.approvals,
@@ -284,10 +325,29 @@ export async function runFiftyAgentScenario(): Promise<ScenarioResult> {
   });
   const deployCommands = await harness.outbox.claim(1000, 'deploy-command-audit');
   const deploymentCompletedAfterApproval = approved.state === 'APPROVED' && (await harness.tasks.get(waiting.id))?.state === 'RUNNING';
-  const deployed = await saveTransition(harness, (await harness.tasks.get(waiting.id))!, 'DEPLOYMENT_RESULT_RECORDED', [`deployment:${waiting.id}:verified`]);
+  const deployed = await new DeploymentResultRecorder({ tasks: harness.tasks, persistence: harness.persistence,
+    now: harness.clock.now, verifier: { async verify(input) {
+      const command = deployCommands.find((item) => item.type === 'DEPLOY' &&
+        item.payload.taskId === input.taskId && item.payload.approvalId === input.approvalId &&
+        item.payload.attemptId === input.attemptId);
+      return command?.type === 'DEPLOY' ? { approvalId: command.payload.approvalId,
+        attemptId: command.payload.attemptId, succeeded: true,
+        evidenceIds: [`deployment:${input.taskId}:verified`] } : null;
+    } } }).record(waiting.id);
   const storedDeployment = await harness.tasks.get(deployed.id);
   if (storedDeployment?.state !== 'COMPLETED') throw new Error('Persisted deployment task did not complete after verified deployment');
   const finalTasks = await harness.tasks.listByWorkflow(workflow);
+  const storedMessages = (await Promise.all(generated.map((task) => messages.list({ kind: 'task', taskId: task.id })))).flat();
+  const storedCheckpoints = (await Promise.all(generated.map((task) =>
+    checkpoints.latest(agentSessionId(`session:dispatch:${task.id}:v1`))))).filter((item) => item !== null);
+  const reviewEvents = (await Promise.all(generated.map((task) => harness.events.readStream(task.id))))
+    .flat().filter((item) => item.eventType === 'REVIEW_REQUESTED');
+  const artifactIds = storedMessages.filter((item) => item.contentReference.startsWith('artifact://'))
+    .map((item) => item.contentReference.slice('artifact://'.length)).sort();
+  const evidenceIds = reviewEvents.flatMap((item) => item.eventType === 'REVIEW_REQUESTED'
+    ? item.payload.evidenceIds ?? [] : []).sort();
+  const testRequestCount = storedMessages.filter((item) => item.contentReference.startsWith('check://test/')).length;
+  const progressMessageCount = storedMessages.filter((item) => item.messageType === 'PROGRESS').length;
   const cost = await costs.getWorkflowCost(workflow);
   metrics.observe('simulated.workflow.cost', cost.estimatedCostUsd, { workflow: workflow });
   return {
@@ -300,18 +360,18 @@ export async function runFiftyAgentScenario(): Promise<ScenarioResult> {
     firstDispatchCount,
     deploymentWaitingForApproval,
     deploymentCompletedAfterApproval,
-    mergeEvidenceCount: agent.artifacts.filter(({ department }) => department === 'Review').length,
+    mergeEvidenceCount: artifactIds.filter((id) => generated.some((task) =>
+      id === `artifact:${task.id}` && task.title?.startsWith('Review '))).length,
     usageRecordCount: costs.usages.length,
     deployCommandCount: deployCommands.filter(({ type }) => type === 'DEPLOY').length,
     deploymentTaskState: storedDeployment.state,
     agentEvidence: {
-      progressCount: evidenceCollection.reduce((sum, evidence) => sum + evidence.progress.length, 0),
-      artifactIds: evidenceCollection.map(({ artifact }) => artifact.artifactId).sort(),
-      reviewRequestCount: evidenceCollection.filter(({ requestedChecks }) => requestedChecks.includes('review')).length,
-      testRequestCount: evidenceCollection.filter(({ requestedChecks }) => requestedChecks.includes('test')).length,
-      checkpointIds: evidenceCollection.map(({ checkpoint }) => checkpoint).sort(),
-      evidenceIds: evidenceCollection.flatMap(({ evidenceIds: ids }) => ids).sort()
-    }
+      progressCount: progressMessageCount, artifactIds, reviewRequestCount: reviewEvents.length,
+      testRequestCount, checkpointIds: storedCheckpoints.map((item) => item.contextReference).sort(),
+      evidenceIds
+    },
+    persistedEvidence: { checkpointCount: storedCheckpoints.length, progressMessageCount,
+      artifactReferenceCount: artifactIds.length, testRequestCount, reviewEventCount: reviewEvents.length }
   };
 }
 

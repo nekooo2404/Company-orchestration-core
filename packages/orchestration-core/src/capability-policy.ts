@@ -8,7 +8,9 @@ import {
   type CorrelationId,
   type TaskId
 } from '@aicompany/contracts';
-import type { ApprovalService, ApprovalRequest } from './approvals';
+import type { ApprovalService, ApprovalRequest } from './approvals.js';
+import type { AgentSessionRepository } from './session-commands.js';
+import type { TaskRepository } from './repository.js';
 
 export interface CapabilityRequest {
   actor: ActorRef;
@@ -53,6 +55,9 @@ const sameActor = (left: ActorRef, right: ActorRef): boolean =>
 export class InMemoryCapabilityPolicy implements CapabilityPolicy {
   public constructor(private readonly options: {
     actorRoles?: ReadonlyMap<string, string>;
+    sessionRepository?: Pick<AgentSessionRepository, 'get'>;
+    taskRepository?: Pick<TaskRepository, 'get'>;
+    resourceScopes?: ReadonlyMap<string, readonly string[]>;
     approvalService?: ApprovalGateway;
     policy?: typeof DEFAULT_CAPABILITY_POLICY;
   } = {}) {}
@@ -74,6 +79,17 @@ export class InMemoryCapabilityPolicy implements CapabilityPolicy {
         requiresApproval: false,
         reason: 'Agent session has no mapped role'
       };
+    }
+    if (actor.kind !== 'AGENT') return { allowed: false, requiresApproval: false, reason: 'Only assigned agent sessions may use capabilities' };
+    const [session, task] = await Promise.all([
+      this.options.sessionRepository?.get(actor.sessionId), this.options.taskRepository?.get(taskId)
+    ]);
+    const resources = this.options.resourceScopes?.get(actor.sessionId);
+    if (!session || !task || session.state !== 'RUNNING' || !['RUNNING', 'REVIEW'].includes(task.state) ||
+        session.taskId !== taskId || session.workflowId !== task.workflowId ||
+        session.agentDefinitionId !== task.ownerAgentDefinitionId || session.traceId !== correlationId ||
+        !resource.startsWith(`project:${task.projectId}:`) || !resources?.includes(resource)) {
+      return { allowed: false, requiresApproval: false, reason: 'Session, task assignment, project or resource is outside the active scope' };
     }
     if (grants?.includes(capability)) {
       return {

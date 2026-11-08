@@ -10,10 +10,10 @@ import {
   type TaskId,
   type WorkflowId
 } from '@aicompany/contracts';
-import { normalizeFailure } from './failure-fingerprint';
+import { normalizeFailure } from './failure-fingerprint.js';
 
-export { InMemoryMetricsSink, NoopMetricsSink, recordMetric } from './metrics';
-export type { MetricsSink, RecordedMetric } from './metrics';
+export { InMemoryMetricsSink, NoopMetricsSink, recordMetric } from './metrics.js';
+export type { MetricsSink, RecordedMetric } from './metrics.js';
 
 export type SpanAttribute = string | number | boolean;
 

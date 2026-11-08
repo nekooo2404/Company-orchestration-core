@@ -9,9 +9,9 @@ import {
   type DomainEvent,
   type EventId
 } from '@aicompany/contracts';
-import { ChannelAuthorizationError, type ChannelAuthorization, type ChannelScope } from './channel-policy';
+import { ChannelAuthorizationError, type ChannelAuthorization, type ChannelScope } from './channel-policy.js';
 
-export type { ChannelScope } from './channel-policy';
+export type { ChannelScope } from './channel-policy.js';
 export type MessageType = 'CHAT' | 'PROGRESS' | 'HANDOFF' | 'BLOCKER';
 
 export interface SendMessageInput {

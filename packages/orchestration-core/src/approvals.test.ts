@@ -68,7 +68,8 @@ describe('ApprovalServiceImpl', () => {
     expect(await events.readStream(task.id)).toEqual(expect.arrayContaining([expect.objectContaining({ eventType: 'DEPLOYMENT_APPROVED' })]));
     expect(await outbox.claim(10, 'deploy-worker')).toEqual(expect.arrayContaining([
       expect.objectContaining({ type: 'REQUEST_APPROVAL' }),
-      expect.objectContaining({ type: 'DEPLOY', payload: { taskId: task.id, approvalId: requested.approvalId } })
+      expect.objectContaining({ type: 'DEPLOY', payload: { taskId: task.id, approvalId: requested.approvalId,
+        attemptId: `deploy:${task.id}:${requested.approvalId}` } })
     ]));
     expect(await approvals.get(requested.approvalId)).toEqual(approved);
   });

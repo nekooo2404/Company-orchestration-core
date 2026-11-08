@@ -8,9 +8,9 @@ import {
   TaskIdSchema,
   WorkflowIdSchema,
   type EventId
-} from './ids';
-import { ActorRefSchema, type ActorRef } from './agent';
-import { ApprovalSubjectTypeSchema } from './approval';
+} from './ids.js';
+import { ActorRefSchema, type ActorRef } from './agent.js';
+import { ApprovalSubjectTypeSchema } from './approval.js';
 
 const nonEmptyText = z.string().refine((value) => value.trim().length > 0);
 const nonEmptyTextArray = z.array(nonEmptyText).min(1);
@@ -101,6 +101,8 @@ export const DeploymentRejectedPayloadSchema = z.object({
 });
 export const DeploymentResultRecordedPayloadSchema = z.object({
   taskId: TaskIdSchema,
+  approvalId: ApprovalIdSchema,
+  attemptId: nonEmptyText,
   evidenceIds: nonEmptyTextArray
 });
 export const ApprovalRequestedPayloadSchema = z.object({
@@ -311,7 +313,8 @@ export const RequestApprovalPayloadSchema = z.object({
 });
 export const DeployPayloadSchema = z.object({
   taskId: TaskIdSchema,
-  approvalId: ApprovalIdSchema
+  approvalId: ApprovalIdSchema,
+  attemptId: nonEmptyText
 });
 
 const commandAuditFields = {

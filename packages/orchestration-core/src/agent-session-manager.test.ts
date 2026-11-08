@@ -8,9 +8,11 @@ import {
   workflowId,
   type Task
 } from '@aicompany/contracts';
-import { AgentSessionManagerService } from './agent-session-manager';
+import { AgentSessionManagerService, SessionManagerLauncher } from './agent-session-manager';
 import { InMemoryAgentSessionRepository, InMemorySessionLifecyclePersistence, type LifecycleWritePoint } from './session-commands';
-import { InMemoryDispatchClaimStore, InMemoryTaskRepository } from './test-support/inmemory-store';
+import { InMemoryApprovalTransactionalPersistence, InMemoryDispatchClaimStore, InMemoryEventStore, InMemoryOutbox, InMemoryTaskRepository } from './test-support/inmemory-store';
+import { InMemoryApprovalStore } from './approvals';
+import { TaskScheduler } from './scheduler';
 import { OptimisticConcurrencyError } from './repository';
 
 const now = new Date('2026-11-08T00:00:00.000Z');
@@ -46,6 +48,25 @@ const setup = (options: { dependentCleanupPending?: () => boolean; workflowActiv
 };
 
 describe('agent session lifecycle', () => {
+  it('uses the scheduler claim identity and the real manager start transaction once', async () => {
+    const h = setup(); await h.tasks.save(task, 0);
+    const events = new InMemoryEventStore();
+    const outbox = new InMemoryOutbox({ now: () => now });
+    const persistence = new InMemoryApprovalTransactionalPersistence({ tasks: h.tasks, events, outbox,
+      approvals: new InMemoryApprovalStore(), claims: h.claims });
+    const scheduler = new TaskScheduler({ taskRepository: h.tasks, transactionalPersistence: persistence,
+      launcher: new SessionManagerLauncher(h.manager), clock: { now: () => now },
+      agentDefinitions: [{ id: agentDefinitionId('agent-1'), department: 'engineering',
+        allowedCapabilities: [], budget: { maxTokens: 100, maxCostUsd: 1 }, maxConcurrency: 1 }] });
+    expect(await scheduler.tick({ workflowId: task.workflowId, capacity: 1, workerId: 'worker-1' })).toHaveLength(1);
+    const sessionId = agentSessionId(`session:dispatch:${task.id}:v0`);
+    expect((await h.sessions.get(sessionId))?.sessionId).toBe(sessionId);
+    expect((await h.tasks.get(task.id))?.state).toBe('RUNNING');
+    expect((await h.tasks.get(task.id))?.ownerAgentDefinitionId).toBe(agentDefinitionId('agent-1'));
+    expect(h.lifecycle.listEvents().map(({ eventType }) => eventType)).toEqual(['TASK_STARTED', 'AGENT_SESSION_STARTED']);
+    expect(h.lifecycle.listCommands()).toHaveLength(1);
+    expect(await outbox.claim(10, 'audit')).toEqual([]);
+  });
   it('starts a leased task and creates a durable session', async () => {
     const h = setup();
     await h.tasks.save(task, 0);
@@ -55,6 +76,20 @@ describe('agent session lifecycle', () => {
     expect(started.sessionId).toBe('session-1');
     expect((await h.tasks.get(task.id))?.state).toBe('RUNNING');
     expect(h.commands).toHaveLength(1);
+  });
+
+  it('commits separate contiguous task and session event streams through start and cancel', async () => {
+    const h = setup(); await h.tasks.save(task, 0); await h.lease();
+    const started = await h.manager.start({ taskId: task.id, leaseId: 'lease-1', agentDefinitionId: agentDefinitionId('agent-1'), correlationId: task.traceId, expectedTaskVersion: 0, idempotencyKey: 'session:session-1' });
+    await h.manager.checkpoint({ sessionId: started.sessionId, expectedSequence: 0, expectedSessionVersion: 0,
+      idempotencyKey: 'ck-stream', state: 'RUNNING', contextReference: 'ctx', lastEventId: eventId('tool-event'), completedOperationKeys: [] });
+    await h.manager.cancel(started.sessionId, 'stop', { expectedVersion: 1, idempotencyKey: 'cancel-stream' });
+    const events = h.lifecycle.listEvents();
+    expect(events.filter(({ aggregateType }) => aggregateType === 'TASK').map(({ eventType, aggregateVersion }) =>
+      [eventType, aggregateVersion])).toEqual([['TASK_STARTED', 1], ['TASK_CANCELLED', 2]]);
+    expect(events.filter(({ aggregateType }) => aggregateType === 'AGENT_SESSION').map(({ eventType, aggregateVersion }) =>
+      [eventType, aggregateVersion])).toEqual([['AGENT_SESSION_STARTED', 1], ['AGENT_SESSION_PAUSED', 2], ['AGENT_SESSION_CANCELLED', 3]]);
+    expect(new Set(events.map(({ eventId: id }) => id)).size).toBe(events.length);
   });
 
   it('checkpoints after an event and resumes with the same identity and completed operation keys', async () => {
@@ -133,6 +168,15 @@ describe('agent session lifecycle', () => {
     await h.manager.checkpoint({ sessionId: session.sessionId, expectedSequence: 0, expectedSessionVersion: 0, idempotencyKey: 'ck1', state: 'WAITING_FOR_TOOL', contextReference: 'ctx', lastEventId: eventId('e1'), completedOperationKeys: ['charged'] });
     await expect(h.manager.checkpoint({ sessionId: session.sessionId, expectedSequence: 1, expectedSessionVersion: 0, idempotencyKey: 'ck2', state: 'RUNNING', contextReference: 'ctx2', lastEventId: eventId('e2'), completedOperationKeys: [] })).rejects.toBeInstanceOf(OptimisticConcurrencyError);
     expect((await h.lifecycle.latest(session.sessionId))?.completedOperationKeys).toEqual(['charged']);
+  });
+
+  it('unions keys on a valid newer checkpoint and rejects terminal checkpoints', async () => {
+    const h = setup(); await h.tasks.save(task, 0); await h.lease();
+    const session = await h.manager.start({ taskId: task.id, leaseId: 'lease-1', agentDefinitionId: agentDefinitionId('agent-1'), correlationId: task.traceId, expectedTaskVersion: 0, idempotencyKey: 'session:session-1' });
+    await h.manager.checkpoint({ sessionId: session.sessionId, expectedSequence: 0, expectedSessionVersion: 0, idempotencyKey: 'ck1', state: 'RUNNING', contextReference: 'ctx', lastEventId: eventId('e1'), completedOperationKeys: ['charged'] });
+    const newer = await h.manager.checkpoint({ sessionId: session.sessionId, expectedSequence: 1, expectedSessionVersion: 1, idempotencyKey: 'ck2', state: 'COMPLETED', contextReference: 'ctx2', lastEventId: eventId('e2'), completedOperationKeys: ['published'] });
+    expect(newer.completedOperationKeys).toEqual(['charged', 'published']);
+    await expect(h.manager.checkpoint({ sessionId: session.sessionId, expectedSequence: 2, expectedSessionVersion: 2, idempotencyKey: 'ck3', state: 'RUNNING', contextReference: 'ctx3', lastEventId: eventId('e3'), completedOperationKeys: [] })).rejects.toThrow(/terminal|completed/i);
   });
 
   it('returns the stored checkpoint for an exact retry using the original session version', async () => {

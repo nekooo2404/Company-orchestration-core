@@ -3,7 +3,7 @@ import {
   InvalidTaskGraphError,
   MissingTaskDependencyError,
   TaskDependencyCycleError
-} from './domain-errors';
+} from './domain-errors.js';
 
 const indexTasks = (tasks: readonly Task[]): Map<TaskId, Task> => {
   const taskById = new Map<TaskId, Task>();

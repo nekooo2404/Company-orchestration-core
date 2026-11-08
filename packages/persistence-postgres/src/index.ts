@@ -1,2 +1,2 @@
-export * from './postgres-store';
-export * from './postgres-repositories';
+export * from './postgres-store.js';
+export * from './postgres-repositories.js';

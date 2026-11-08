@@ -17,6 +17,8 @@ import {
   InvalidPersistenceOperationError,
   OptimisticConcurrencyError
 } from './test-support/inmemory-store';
+import { InMemoryApprovalTransactionalPersistence } from './test-support/inmemory-store';
+import { InMemoryApprovalStore } from './approvals';
 
 const now = new Date('2026-11-08T00:00:00.000Z');
 
@@ -66,6 +68,38 @@ const makeCommand = (commandIdentifier = 'command-1', overrides: Partial<OutboxC
 });
 
 describe('in-memory persistence adapters', () => {
+  it('rolls back task and event when an outbox command is invalid', async () => {
+    const tasks = new InMemoryTaskRepository();
+    const events = new InMemoryEventStore();
+    const outbox = new InMemoryOutbox();
+    const persistence = new InMemoryApprovalTransactionalPersistence({
+      tasks, events, outbox, approvals: new InMemoryApprovalStore()
+    });
+    await tasks.save(makeTask(), 0);
+    await expect(persistence.saveTaskAndAppend({
+      task: makeTask({ state: 'READY', version: 1 }), expectedVersion: 0,
+      events: [makeEvent(1)], commands: [makeCommand('invalid', { claimedBy: 'worker' })]
+    })).rejects.toThrow();
+    expect((await tasks.get(taskId('task-1')))?.state).toBe('PENDING');
+    expect(await events.readStream('task-1')).toEqual([]);
+  });
+
+  it('serializes concurrent task transitions so only one event and command commits', async () => {
+    const tasks = new InMemoryTaskRepository();
+    const events = new InMemoryEventStore();
+    const outbox = new InMemoryOutbox({ now: () => now });
+    const persistence = new InMemoryApprovalTransactionalPersistence({ tasks, events, outbox,
+      approvals: new InMemoryApprovalStore() });
+    await tasks.save(makeTask(), 0);
+    const first = persistence.saveTaskAndAppend({ task: makeTask({ state: 'READY', version: 1 }),
+      expectedVersion: 0, events: [makeEvent(1, 'first')], commands: [makeCommand('first-command')] });
+    const second = persistence.saveTaskAndAppend({ task: makeTask({ state: 'BLOCKED', version: 1 }),
+      expectedVersion: 0, events: [makeEvent(1, 'second')], commands: [makeCommand('second-command')] });
+    const results = await Promise.allSettled([first, second]);
+    expect(results.filter(({ status }) => status === 'fulfilled')).toHaveLength(1);
+    expect(await events.readStream('task-1')).toHaveLength(1);
+    expect(await outbox.claim(10, 'audit')).toHaveLength(1);
+  });
   it('exports the deterministic event store adapter', () => {
     expect('InMemoryEventStore' in orchestrationCore).toBe(true);
   });

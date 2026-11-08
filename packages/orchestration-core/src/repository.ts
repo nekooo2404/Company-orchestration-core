@@ -35,5 +35,6 @@ export class InvalidPersistenceOperationError extends Error {
 export interface TaskRepository {
   get(taskId: TaskId): Promise<Task | null>;
   listByWorkflow(workflowId: WorkflowId): Promise<Task[]>;
+  countActiveByAgent(agentId: NonNullable<Task['ownerAgentDefinitionId']>): Promise<number>;
   save(task: Task, expectedVersion: number): Promise<void>;
 }

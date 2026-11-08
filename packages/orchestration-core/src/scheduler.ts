@@ -4,21 +4,21 @@ import {
   type Task,
   agentSessionId
 } from '@aicompany/contracts';
-import { findReadyTasks } from './task-graph';
-import { transitionTask } from './task-state-machine';
-import { FairQueue, type FairQueueEntry, type FairQueueOptions } from './fair-queue';
-import type { Lease } from './leases';
-import type { TaskRepository } from './repository';
+import { findReadyTasks } from './task-graph.js';
+import { transitionTask } from './task-state-machine.js';
+import { FairQueue, type FairQueueEntry, type FairQueueOptions } from './fair-queue.js';
+import type { Lease } from './leases.js';
+import type { TaskRepository } from './repository.js';
 import type {
   AgentSessionLauncher,
   DispatchDecision,
   DispatchOptions,
   DispatchRecoveryCoordinator,
   TaskDispatcher
-} from './dispatch';
-import { TaskDispatcher as DefaultTaskDispatcher } from './dispatch';
-import type { Outbox, TransactionalPersistence } from './ports';
-import type { Clock } from './leases';
+} from './dispatch.js';
+import { TaskDispatcher as DefaultTaskDispatcher } from './dispatch.js';
+import type { Outbox, TransactionalPersistence } from './ports.js';
+import type { Clock } from './leases.js';
 
 export interface SchedulerTickInput {
   workflowId: Task['workflowId'];
@@ -250,10 +250,11 @@ export class SchedulerService implements Scheduler {
       taskState: readyTask.state,
       workerId,
       agentDefinitionId: agentDefinitionIdValue,
-      sessionId: agentSessionId(`session:dispatch:${readyTask.id}`),
-      leaseId: `dispatch:${readyTask.id}`,
+      sessionId: agentSessionId(`session:dispatch:${readyTask.id}:v${readyTask.version}`),
+      leaseId: `dispatch:${readyTask.id}:v${readyTask.version}`,
       now,
-      expiresAt: new Date(now.getTime() + durationMs)
+      expiresAt: new Date(now.getTime() + durationMs),
+      maxConcurrency: agent.maxConcurrency
     });
     if (claim === null) return null;
     const lease: Lease = { taskId: task.id, leaseId: claim.leaseId, expiresAt: claim.expiresAt };
@@ -261,7 +262,8 @@ export class SchedulerService implements Scheduler {
         task: readyTask,
         agentDefinitionId: agentDefinitionIdValue,
         lease,
-        sessionId: claim.sessionId
+        sessionId: claim.sessionId,
+        claim
       });
       if (result.releaseClaim) {
         await this.options.transactionalPersistence.releaseDispatch(task.id, workerId, lease.leaseId);

@@ -144,12 +144,14 @@ const add = (summary: CostSummary, record: UsageRecord): void => {
 
 const emptySummary = (workflowId?: WorkflowId): CostSummary => ({
   ...(workflowId === undefined ? {} : { workflowId }), inputTokens: 0, outputTokens: 0,
-  estimatedCostUsd: 0, byModel: {}, byDepartment: {}, byAgent: {}
+  estimatedCostUsd: 0, byModel: Object.create(null), byDepartment: Object.create(null), byAgent: Object.create(null)
 });
 
 const cloneUsage = (record: UsageRecord): UsageRecord => ({ ...record, createdAt: new Date(record.createdAt) });
 const cloneSummary = (summary: CostSummary): CostSummary => ({
-  ...summary, byModel: { ...summary.byModel }, byDepartment: { ...summary.byDepartment }, byAgent: { ...summary.byAgent }
+  ...summary, byModel: Object.assign(Object.create(null), summary.byModel),
+  byDepartment: Object.assign(Object.create(null), summary.byDepartment),
+  byAgent: Object.assign(Object.create(null), summary.byAgent)
 });
 
 const usageIdOrder = (left: UsageRecord, right: UsageRecord): number =>
@@ -199,7 +201,7 @@ export class InMemoryCostUsage {
     const workflowId = WorkflowIdSchema.parse(input.workflowId);
     const agentDefinitionId = AgentDefinitionIdSchema.parse(input.agentDefinitionId);
     const department = text(input.department, 'department');
-    const projectedScope = validateProjectedScope(input.projectedScope);
+    validateProjectedScope(input.projectedScope);
     validateBudget(input.taskBudget, 'task');
     validateBudget(input.agentBudget, 'agent');
     validateBudget(input.workflowBudget, 'workflow');
@@ -214,10 +216,8 @@ export class InMemoryCostUsage {
     for (const [scope, scopeRecords, budget] of [
       ['task', taskRecords, input.taskBudget], ['agent', agentRecords, input.agentBudget], ['workflow', workflowRecords, input.workflowBudget]
     ] as const) {
-      const projectedTokens = scope === projectedScope
-        ? input.projectedInputTokens + input.projectedOutputTokens
-        : 0;
-      const projectedCost = scope === projectedScope ? input.projectedCostUsd : 0;
+      const projectedTokens = input.projectedInputTokens + input.projectedOutputTokens;
+      const projectedCost = input.projectedCostUsd;
       const tokens = scopeRecords.reduce((sum, record) => sum + record.inputTokens + record.outputTokens, projectedTokens);
       const cost = scopeRecords.reduce((sum, record) => sum + record.estimatedCostUsd, projectedCost);
       if (tokens > budget.maxTokens || cost > budget.maxCostUsd) {

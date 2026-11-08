@@ -6,6 +6,8 @@ import {
 import {
   DuplicatePersistenceIdError,
   InvalidPersistenceOperationError,
+  type RecoveryRecord,
+  type RecoveryRecordStore,
   type Outbox,
   type TaskRepository
 } from '@aicompany/orchestration-core';
@@ -16,14 +18,19 @@ import {
   parseTask,
   parseTaskId,
   parseWorkflowId,
-  sameOutboxCommandIdentity
-} from './persistence-validation';
+  sameOutboxCommandIdentity,
+  sameValue
+} from './persistence-validation.js';
 import {
   saveTaskSnapshot,
+  parseRecoveryRecord,
+  recoveryRecordFromRow,
+  recoveryRecordParameters,
   taskFromRow,
   type OutboxCommandRow,
+  type RecoveryRecordRow,
   type TaskRow
-} from './postgres-store';
+} from './postgres-store.js';
 
 const clone = <T>(value: T): T => globalThis.structuredClone(value);
 
@@ -57,8 +64,63 @@ const commandParameters = (command: OutboxCommand): unknown[] => [
   command.causationId
 ];
 
+const recoveryRecordColumns = `recovery_id, task_id, cycle, fingerprint, plan, state, created_at, evidence_ids,
+  start_fingerprint, completion_fingerprint, start_idempotency_key, start_request_fingerprint,
+  completion_idempotency_key, completion_request_fingerprint, idempotency_key, request_fingerprint`;
+
+export class PostgresRecoveryRecordStore implements RecoveryRecordStore {
+  public constructor(private readonly pool: Pool) {}
+
+  public async get(recoveryId: string): Promise<RecoveryRecord | null> {
+    const canonicalRecoveryId = canonicalId(recoveryId, 'recoveryId');
+    const result = await this.pool.query<RecoveryRecordRow>(
+      `SELECT ${recoveryRecordColumns}
+       FROM recovery_records
+       WHERE recovery_id = $1`,
+      [canonicalRecoveryId]
+    );
+    return result.rowCount === 0 ? null : recoveryRecordFromRow(result.rows[0]);
+  }
+
+  public async list(taskId: Task['id']): Promise<RecoveryRecord[]> {
+    const canonicalTaskId = parseTaskId(taskId);
+    const result = await this.pool.query<RecoveryRecordRow>(
+      `SELECT ${recoveryRecordColumns}
+       FROM recovery_records
+       WHERE task_id = $1
+       ORDER BY cycle ASC, recovery_id ASC`,
+      [canonicalTaskId]
+    );
+    return result.rows.map(recoveryRecordFromRow);
+  }
+
+  public async save(record: RecoveryRecord): Promise<void> {
+    const parsed = parseRecoveryRecord(record);
+    await this.pool.query(
+       `INSERT INTO recovery_records (
+         recovery_id, task_id, cycle, fingerprint, plan, state, created_at, evidence_ids,
+         start_fingerprint, completion_fingerprint, start_idempotency_key, start_request_fingerprint,
+         completion_idempotency_key, completion_request_fingerprint, idempotency_key, request_fingerprint
+       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+       ON CONFLICT (recovery_id) DO NOTHING`,
+      recoveryRecordParameters(parsed)
+    );
+    const persisted = await this.get(parsed.recoveryId);
+    if (persisted === null || !sameValue(persisted, parsed)) {
+      throw new DuplicatePersistenceIdError('recovery record', parsed.recoveryId);
+    }
+  }
+}
+
 export class PostgresTaskRepository implements TaskRepository {
   public constructor(private readonly pool: Pool) {}
+
+  public async countActiveByAgent(agentId: NonNullable<Task['ownerAgentDefinitionId']>): Promise<number> {
+    const result = await this.pool.query<{ count: string }>(
+      "SELECT COUNT(*)::text AS count FROM tasks WHERE owner_agent_definition_id = $1 AND state = 'RUNNING'", [agentId]
+    );
+    return Number(result.rows[0].count);
+  }
 
   public async get(taskId: string): Promise<Task | null> {
     const canonicalTaskId = parseTaskId(taskId);
@@ -66,7 +128,7 @@ export class PostgresTaskRepository implements TaskRepository {
       `SELECT task_id, workflow_id, state, dependency_ids, recovery_cycles, version,
               updated_at, required_capabilities, output_contract, budget, project_id,
               parent_task_id, owner_agent_definition_id, deadline, trace_id, created_at,
-              priority, title, description, is_deployment
+              priority, title, description, is_deployment, deployment_approval_id, deployment_attempt_id
        FROM tasks
        WHERE task_id = $1`,
       [canonicalTaskId]
@@ -80,7 +142,7 @@ export class PostgresTaskRepository implements TaskRepository {
       `SELECT task_id, workflow_id, state, dependency_ids, recovery_cycles, version,
               updated_at, required_capabilities, output_contract, budget, project_id,
               parent_task_id, owner_agent_definition_id, deadline, trace_id, created_at,
-              priority, title, description, is_deployment
+              priority, title, description, is_deployment, deployment_approval_id, deployment_attempt_id
        FROM tasks
        WHERE workflow_id = $1
        ORDER BY task_id ASC`,

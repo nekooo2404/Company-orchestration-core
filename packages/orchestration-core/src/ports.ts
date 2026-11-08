@@ -6,7 +6,8 @@ import type {
   Task,
   AgentSessionId
 } from '@aicompany/contracts';
-export type { TaskRepository } from './repository';
+import type { RecoveryRecord } from './recovery.js';
+export type { TaskRepository } from './repository.js';
 
 export interface EventStore {
   append(events: readonly DomainEvent[], expectedVersion: number): Promise<void>;
@@ -45,9 +46,13 @@ export interface SaveApprovalRequestInput {
 
 export interface TransactionalPersistence {
   saveTaskAndAppend(input: SaveTaskAndAppendInput): Promise<void>;
+  saveRecoveryAndAppend(input: SaveTaskAndAppendInput & { record: RecoveryRecord; idempotencyKey: string; requestFingerprint: string }): Promise<void>;
   saveApprovalRequest(input: SaveApprovalRequestInput): Promise<ApprovalRecord>;
   saveApprovalDecisionAndTask(input: SaveApprovalDecisionAndTaskInput): Promise<void>;
   claimDispatch(input: DispatchClaimRequest): Promise<DispatchClaim | null>;
+  getDispatchClaim(taskId: Task['id']): Promise<DispatchClaim | null>;
+  beginDispatchCleanup(taskId: Task['id'], workerId: string, leaseId: string, generation: number): Promise<boolean>;
+  abortDispatchCleanup(taskId: Task['id'], workerId: string, leaseId: string, generation: number): Promise<void>;
   releaseDispatch(taskId: Task['id'], workerId: string, leaseId: string): Promise<boolean>;
 }
 
@@ -61,13 +66,16 @@ export interface DispatchClaimRequest {
   leaseId: string;
   now: Date;
   expiresAt: Date;
+  maxConcurrency?: number;
 }
 
-export type DispatchClaim = DispatchClaimRequest;
+export type DispatchClaim = DispatchClaimRequest & { generation: number; cleanupInProgress: boolean };
 
 export interface DispatchClaimStore {
   claimDispatch(input: DispatchClaimRequest): Promise<DispatchClaim | null>;
   getDispatchClaim(taskId: Task['id']): Promise<DispatchClaim | null>;
+  beginDispatchCleanup(taskId: Task['id'], workerId: string, leaseId: string, generation: number): Promise<boolean>;
+  abortDispatchCleanup(taskId: Task['id'], workerId: string, leaseId: string, generation: number): Promise<void>;
   releaseDispatch(taskId: Task['id'], workerId: string, leaseId: string): Promise<boolean>;
 }
 

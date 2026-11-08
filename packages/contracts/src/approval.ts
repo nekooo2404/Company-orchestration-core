@@ -3,8 +3,8 @@ import {
   ApprovalIdSchema,
   CorrelationIdSchema,
   EventIdSchema
-} from './ids';
-import { ActorRefSchema } from './agent';
+} from './ids.js';
+import { ActorRefSchema } from './agent.js';
 
 const nonEmptyText = z.string().refine((value) => value.trim().length > 0);
 

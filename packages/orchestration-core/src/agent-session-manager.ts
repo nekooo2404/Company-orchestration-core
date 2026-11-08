@@ -10,14 +10,15 @@ import {
   type OutboxCommand,
   type TaskId
 } from '@aicompany/contracts';
-import type { Clock } from './leases';
-import { InvalidTaskTransitionError } from './domain-errors';
-import type { CheckpointStore, AgentCheckpoint, AgentCheckpointState } from './checkpoints';
-import { canonicalFingerprint, type AgentSessionRepository, type SessionLifecyclePersistence, type WorkflowStatusReader } from './session-commands';
-import type { TaskRepository } from './repository';
-import type { DispatchClaimStore } from './ports';
-import { OptimisticConcurrencyError } from './repository';
-import { transitionTask } from './task-state-machine';
+import type { Clock } from './leases.js';
+import { InvalidTaskTransitionError } from './domain-errors.js';
+import type { CheckpointStore, AgentCheckpoint, AgentCheckpointState } from './checkpoints.js';
+import { canonicalFingerprint, type AgentSessionRepository, type SessionLifecyclePersistence, type WorkflowStatusReader } from './session-commands.js';
+import type { TaskRepository } from './repository.js';
+import type { DispatchClaimStore } from './ports.js';
+import type { AgentSessionLauncher, LaunchAgentSessionInput } from './dispatch.js';
+import { OptimisticConcurrencyError } from './repository.js';
+import { transitionTask } from './task-state-machine.js';
 
 export interface StartSessionInput {
   taskId: TaskId;
@@ -92,8 +93,11 @@ export class AgentSessionManagerService implements AgentSessionManager {
     if (!claim || claim.leaseId !== input.leaseId || claim.expiresAt.getTime() <= this.options.clock.now().getTime() || claim.taskVersion !== task.version || claim.agentDefinitionId !== input.agentDefinitionId) throw new Error('Current dispatch lease is missing, expired, stale, or does not match');
     if (task.state !== 'READY') throw new InvalidTaskTransitionError(task.id, task.state, 'TASK_STARTED');
     const now = this.options.clock.now();
-    const sessionId = agentSessionId(input.idempotencyKey.startsWith('session:') ? input.idempotencyKey.slice('session:'.length) : input.idempotencyKey);
-    const transitioned = transitionTask(task, { type: 'TASK_STARTED', sessionId }, {
+    const sessionId = claim.sessionId;
+    const assignedTask = task.ownerAgentDefinitionId === null
+      ? { ...task, ownerAgentDefinitionId: input.agentDefinitionId }
+      : task;
+    const transitioned = transitionTask(assignedTask, { type: 'TASK_STARTED', sessionId }, {
       actor, now, evidenceIds: [], isDeployment: task.isDeployment ?? false
     });
     const session = AgentSessionSchema.parse({
@@ -109,12 +113,12 @@ export class AgentSessionManagerService implements AgentSessionManager {
       payload: { taskId: task.id, workflowId: task.workflowId, agentDefinitionId: input.agentDefinitionId,
         leaseId: input.leaseId, idempotencyKey: sessionId, attempt: 1, completedOperationKeys: [] }
     };
-    const event = DomainEventSchema.parse({ eventId: transitioned.event.eventId, aggregateType: 'AGENT_SESSION',
+    const event = DomainEventSchema.parse({ eventId: eventId(`session:${sessionId}:v1`), aggregateType: 'AGENT_SESSION',
       aggregateId: sessionId, aggregateVersion: 1, eventType: 'AGENT_SESSION_STARTED', actor,
-      correlationId: input.correlationId, causationId: transitioned.event.causationId, occurredAt: now,
+      correlationId: input.correlationId, causationId: transitioned.event.eventId, occurredAt: now,
       payload: { sessionId, taskId: task.id } });
     await this.options.lifecyclePersistence.start({ task: transitioned.task, expectedTaskVersion: task.version, session,
-      expectedSessionVersion: 0, event, command, idempotencyKey: input.idempotencyKey,
+      expectedSessionVersion: 0, taskEvent: transitioned.event, event, command, idempotencyKey: input.idempotencyKey,
       requestFingerprint: this.startFingerprint(input) });
     return session;
   }
@@ -133,20 +137,23 @@ export class AgentSessionManagerService implements AgentSessionManager {
     }
     const session = await this.requireSession(input.sessionId);
     if (session.version !== input.expectedSessionVersion) throw new OptimisticConcurrencyError(session.sessionId, input.expectedSessionVersion, session.version);
+    if (session.state === 'CANCELLED' || session.state === 'COMPLETED' || session.state === 'FAILED') throw new Error('Terminal session cannot be checkpointed');
+    const task = await this.options.taskRepository.get(session.taskId);
+    if (!task || task.state === 'CANCELLED' || task.state === 'COMPLETED' || task.state === 'ESCALATED_TO_CEO') throw new Error('Terminal task cannot be checkpointed');
     const latest = await this.options.checkpointStore.latest(input.sessionId);
     const current = latest?.sequence ?? 0;
     if (input.expectedSequence !== current) throw new Error(`Checkpoint sequence conflict: expected ${input.expectedSequence}, actual ${current}`);
     const checkpoint: AgentCheckpoint = {
       sessionId: session.sessionId, taskId: session.taskId, sequence: current + 1,
       state: input.state, contextReference: input.contextReference,
-      lastEventId: input.lastEventId, completedOperationKeys: [...new Set(input.completedOperationKeys)],
+      lastEventId: input.lastEventId, completedOperationKeys: [...new Set([...(latest?.completedOperationKeys ?? []), ...input.completedOperationKeys])],
       createdAt: this.options.clock.now()
     };
     const updated = { ...session, state: input.state, contextReference: input.contextReference,
       checkpointReference: `${session.sessionId}:checkpoint:${checkpoint.sequence}`,
       version: session.version + 1, updatedAt: checkpoint.createdAt };
     const event = DomainEventSchema.parse({ eventId: this.newEventId(), aggregateType: 'AGENT_SESSION',
-      aggregateId: session.sessionId, aggregateVersion: updated.version, eventType: input.state === 'COMPLETED' ? 'AGENT_SESSION_COMPLETED' : 'AGENT_SESSION_PAUSED', actor,
+      aggregateId: session.sessionId, aggregateVersion: updated.version + 1, eventType: input.state === 'COMPLETED' ? 'AGENT_SESSION_COMPLETED' : 'AGENT_SESSION_PAUSED', actor,
       correlationId: session.traceId, causationId: input.lastEventId, occurredAt: checkpoint.createdAt,
       payload: { sessionId: session.sessionId, reason: 'checkpoint' } });
     await this.options.lifecyclePersistence.checkpoint({ checkpoint, session: updated, expectedSessionVersion: session.version,
@@ -193,7 +200,7 @@ export class AgentSessionManagerService implements AgentSessionManager {
         leaseId: `resume:${sessionId}:${attempt}`, idempotencyKey: sessionId, attempt,
         completedOperationKeys: [...checkpoint.completedOperationKeys] } };
     const event = DomainEventSchema.parse({ eventId: causationId, aggregateType: 'AGENT_SESSION',
-      aggregateId: sessionId, aggregateVersion: updated.version, eventType: 'AGENT_SESSION_RESUMED', actor,
+      aggregateId: sessionId, aggregateVersion: updated.version + 1, eventType: 'AGENT_SESSION_RESUMED', actor,
       correlationId: session.traceId, causationId: checkpoint.lastEventId, occurredAt: now,
       payload: { sessionId } });
     try {
@@ -224,7 +231,7 @@ export class AgentSessionManagerService implements AgentSessionManager {
     const latest = await this.options.checkpointStore.latest(sessionId);
     const requestFingerprint = canonicalFingerprint({ operation: 'pause', sessionId, expectedVersion: session.version, reason });
     const event = DomainEventSchema.parse({ eventId: this.newEventId(), aggregateType: 'AGENT_SESSION',
-      aggregateId: sessionId, aggregateVersion: updated.version, eventType: 'AGENT_SESSION_PAUSED', actor,
+      aggregateId: sessionId, aggregateVersion: updated.version + 1, eventType: 'AGENT_SESSION_PAUSED', actor,
       correlationId: session.traceId, causationId: latest?.lastEventId ?? this.newEventId(), occurredAt: now,
       payload: { sessionId, reason } });
     await this.options.lifecyclePersistence.transition({ session: updated, expectedSessionVersion: session.version, event, command: null, expectedTaskVersion: null,
@@ -251,14 +258,15 @@ export class AgentSessionManagerService implements AgentSessionManager {
     });
     const event = DomainEventSchema.parse({
       eventId: this.newEventId(), aggregateType: 'AGENT_SESSION', aggregateId: session.sessionId,
-      aggregateVersion: session.version + 1, eventType: 'AGENT_SESSION_CANCELLED',
+      aggregateVersion: session.version + 2, eventType: 'AGENT_SESSION_CANCELLED',
       actor, correlationId: session.traceId, causationId: transitioned.event.eventId, occurredAt: now,
       payload: { sessionId, reason }
     });
     const cancelledSession = AgentSessionSchema.parse({ ...session, state: 'CANCELLED', version: session.version + 1, updatedAt: now });
     const requestFingerprint = canonicalFingerprint({ operation: 'cancel', sessionId, expectedVersion: session.version, reason });
     await this.options.lifecyclePersistence.cancel({ task: transitioned.task, expectedTaskVersion: task.version,
-      session: cancelledSession, expectedSessionVersion: session.version, event, idempotencyKey: options.idempotencyKey, requestFingerprint });
+      session: cancelledSession, expectedSessionVersion: session.version, taskEvent: transitioned.event,
+      event, idempotencyKey: options.idempotencyKey, requestFingerprint });
   }
 
   private async requireSession(sessionId: AgentSessionId): Promise<AgentSession> {
@@ -285,5 +293,21 @@ export class AgentSessionManagerService implements AgentSessionManager {
   private newEventId() {
     this.nextEvent += 1;
     return this.options.eventIdFactory?.() ?? eventId(`agent-session-event-${this.nextEvent}`);
+  }
+}
+
+export class SessionManagerLauncher implements AgentSessionLauncher {
+  public readonly persistsStart = true;
+
+  public constructor(private readonly manager: AgentSessionManager) {}
+
+  public launch(input: LaunchAgentSessionInput): Promise<AgentSession> {
+    return this.manager.start({ taskId: input.taskId, leaseId: input.leaseId,
+      agentDefinitionId: input.agentDefinitionId, correlationId: input.correlationId,
+      expectedTaskVersion: input.expectedTaskVersion, idempotencyKey: input.idempotencyKey });
+  }
+
+  public async stop(): Promise<void> {
+    throw new Error('Manager-owned startup cannot be stopped through the dispatch launcher');
   }
 }

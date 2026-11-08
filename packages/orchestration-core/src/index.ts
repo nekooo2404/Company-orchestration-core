@@ -1,29 +1,30 @@
-export * from './domain-errors';
-export * from './ports';
+export * from './domain-errors.js';
+export * from './ports.js';
 export {
   DuplicatePersistenceIdError,
   InvalidPersistenceOperationError,
   OptimisticConcurrencyError
-} from './repository';
-export * from './task-graph';
-export * from './agent-session-manager';
-export * from './checkpoints';
-export * from './session-commands';
-export * from './task-state-machine';
-export * from './fair-queue';
-export * from './leases';
-export * from './dispatch';
-export * from './scheduler';
-export * from './channel-policy';
-export * from './communication';
-export * from './decision-records';
-export * from './failure-fingerprint';
-export * from './recovery-strategies';
-export * from './recovery';
-export { DEFAULT_CAPABILITY_POLICY, InMemoryCapabilityPolicy } from './capability-policy';
-export type { CapabilityRequest, CapabilityDecision, CapabilityPolicy as CapabilityEvaluationPolicy } from './capability-policy';
-export * from './approvals';
-export * from './ceo-commands';
-export * from './observability';
-export * from './cost';
-export * from './test-support/inmemory-store';
+} from './repository.js';
+export * from './task-graph.js';
+export * from './agent-session-manager.js';
+export * from './checkpoints.js';
+export * from './session-commands.js';
+export * from './task-state-machine.js';
+export * from './fair-queue.js';
+export * from './leases.js';
+export * from './dispatch.js';
+export * from './scheduler.js';
+export * from './channel-policy.js';
+export * from './communication.js';
+export * from './decision-records.js';
+export * from './failure-fingerprint.js';
+export * from './recovery-strategies.js';
+export * from './recovery.js';
+export { DEFAULT_CAPABILITY_POLICY, InMemoryCapabilityPolicy } from './capability-policy.js';
+export type { CapabilityRequest, CapabilityDecision, CapabilityPolicy as CapabilityEvaluationPolicy } from './capability-policy.js';
+export * from './approvals.js';
+export * from './ceo-commands.js';
+export * from './observability.js';
+export * from './cost.js';
+export * from './deployment-result.js';
+export * from './test-support/inmemory-store.js';

@@ -46,6 +46,8 @@ export class InMemoryCheckpointStore implements CheckpointStore {
     if (!current && checkpoint.sequence !== 1) {
       throw new Error(`First checkpoint sequence for ${checkpoint.sessionId} must be 1`);
     }
+    if (current?.state === 'COMPLETED') throw new Error('Completed session checkpoint is terminal');
+    checkpoint.completedOperationKeys = [...new Set([...(current?.completedOperationKeys ?? []), ...checkpoint.completedOperationKeys])];
     this.checkpoints.set(checkpoint.sessionId, checkpoint);
   }
 
