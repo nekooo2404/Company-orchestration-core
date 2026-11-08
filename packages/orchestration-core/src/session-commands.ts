@@ -28,12 +28,15 @@ export interface SnapshotAgentSessionRepository extends AgentSessionRepository {
   restoreIdempotency(taskId: Task['id'], key: string, value: AgentSessionId | null): void;
   bindStartFingerprint(taskId: Task['id'], key: string, fingerprint: string): void;
   restoreStartFingerprint(taskId: Task['id'], key: string, value: string | null): void;
+  snapshotRequestFingerprint(key: string): string | null;
+  restoreRequestFingerprint(key: string, value: string | null): void;
 }
 
 export class InMemoryAgentSessionRepository implements SnapshotAgentSessionRepository {
   private readonly sessions = new Map<AgentSessionId, AgentSession>();
   private readonly idempotencyKeys = new Map<string, AgentSessionId>();
   private readonly startFingerprints = new Map<string, string>();
+  private readonly requestFingerprints = new Map<string, string>();
 
   public async get(sessionId: AgentSessionId): Promise<AgentSession | null> {
     const session = this.sessions.get(sessionId);
@@ -67,6 +70,8 @@ export class InMemoryAgentSessionRepository implements SnapshotAgentSessionRepos
   public startFingerprint(taskId: Task['id'], key: string): string | null { return this.startFingerprints.get(`${taskId}:${key}`) ?? null; }
   public bindStartFingerprint(taskId: Task['id'], key: string, fingerprint: string): void { this.startFingerprints.set(`${taskId}:${key}`, fingerprint); }
   public restoreStartFingerprint(taskId: Task['id'], key: string, value: string | null): void { if (value) this.startFingerprints.set(`${taskId}:${key}`, value); else this.startFingerprints.delete(`${taskId}:${key}`); }
+  public snapshotRequestFingerprint(key: string): string | null { return this.requestFingerprints.get(key) ?? null; }
+  public restoreRequestFingerprint(key: string, value: string | null): void { if (value) this.requestFingerprints.set(key, value); else this.requestFingerprints.delete(key); }
   public unbindIdempotency(taskId: Task['id'], key: string): void { this.idempotencyKeys.delete(`${taskId}:${key}`); }
   public snapshotIdempotency(taskId: Task['id'], key: string): AgentSessionId | null { return this.idempotencyKeys.get(`${taskId}:${key}`) ?? null; }
   public restoreIdempotency(taskId: Task['id'], key: string, value: AgentSessionId | null): void {
@@ -83,15 +88,14 @@ export interface WorkflowStatusReader {
 }
 
 export interface SessionLifecyclePersistence {
-  start(input: { task: Task; expectedTaskVersion: number; session: AgentSession; expectedSessionVersion: 0; event: DomainEvent; command: OutboxCommand; idempotencyKey: string }): Promise<void>;
-  checkpoint(input: { checkpoint: AgentCheckpoint; session: AgentSession; expectedSessionVersion: number; event: DomainEvent; idempotencyKey: string }): Promise<void>;
-  transition(input: { session: AgentSession; expectedSessionVersion: number; event: DomainEvent; command: OutboxCommand | null; expectedTaskVersion: number | null; idempotencyKey: string }): Promise<void>;
-  cancel(input: { task: Task; expectedTaskVersion: number; session: AgentSession; expectedSessionVersion: number; event: DomainEvent; idempotencyKey: string }): Promise<void>;
-  hasOperation(idempotencyKey: string): Promise<boolean>;
+  start(input: { task: Task; expectedTaskVersion: number; session: AgentSession; expectedSessionVersion: 0; event: DomainEvent; command: OutboxCommand; idempotencyKey: string; requestFingerprint: string }): Promise<void>;
+  checkpoint(input: { checkpoint: AgentCheckpoint; session: AgentSession; expectedSessionVersion: number; event: DomainEvent; idempotencyKey: string; requestFingerprint: string }): Promise<void>;
+  transition(input: { session: AgentSession; expectedSessionVersion: number; event: DomainEvent; command: OutboxCommand | null; expectedTaskVersion: number | null; idempotencyKey: string; requestFingerprint: string }): Promise<void>;
+  cancel(input: { task: Task; expectedTaskVersion: number; session: AgentSession; expectedSessionVersion: number; event: DomainEvent; idempotencyKey: string; requestFingerprint: string }): Promise<void>;
   operationFingerprint(idempotencyKey: string): string | null;
-  recordRequest(idempotencyKey: string, fingerprint: string): void;
   requestFingerprint(idempotencyKey: string): string | null;
   operationResult(idempotencyKey: string): { sessionId: AgentSessionId; version: number; attempt: number } | null;
+  operationCheckpoint(idempotencyKey: string): AgentCheckpoint | null;
 }
 
 export type LifecycleWritePoint = 'task' | 'session' | 'checkpoint' | 'event' | 'command';
@@ -100,13 +104,13 @@ export interface InMemoryLifecycleOptions { failAt?: (point: LifecycleWritePoint
 export class InMemorySessionLifecyclePersistence implements SessionLifecyclePersistence, CheckpointStore {
   private readonly operations = new Map<string, string>();
   private readonly operationResults = new Map<string, { sessionId: AgentSessionId; version: number; attempt: number }>();
-  private readonly requests = new Map<string, string>();
+  private readonly operationCheckpoints = new Map<string, AgentCheckpoint>();
   private readonly checkpoints = new Map<AgentSessionId, AgentCheckpoint>();
   private readonly events: DomainEvent[] = [];
   private readonly commands: OutboxCommand[] = [];
   private transactionTail: Promise<void> = Promise.resolve();
 
-  public constructor(private readonly tasks: InMemoryTaskRepository, private readonly sessions: AgentSessionRepository, private readonly options: InMemoryLifecycleOptions = {}) {}
+  public constructor(private readonly tasks: InMemoryTaskRepository, private readonly sessions: SnapshotAgentSessionRepository, private readonly options: InMemoryLifecycleOptions = {}) {}
 
   public async start(input: Parameters<SessionLifecyclePersistence['start']>[0]): Promise<void> {
     return this.serialize(async () => {
@@ -119,13 +123,13 @@ export class InMemorySessionLifecyclePersistence implements SessionLifecyclePers
     await this.atomic(input.idempotencyKey, async () => {
       await this.tasks.save(input.task, input.expectedTaskVersion); this.options.failAt?.('task');
       await this.sessions.save(input.session, input.expectedSessionVersion); this.options.failAt?.('session');
-      if (this.sessions instanceof InMemoryAgentSessionRepository) this.sessions.bindIdempotency(input.task.id, input.idempotencyKey, input.session.sessionId);
-      if (this.sessions instanceof InMemoryAgentSessionRepository && input.command.type === 'START_AGENT_SESSION') this.sessions.bindStartFingerprint(input.task.id, input.idempotencyKey, JSON.stringify({
+      this.sessions.bindIdempotency(input.task.id, input.idempotencyKey, input.session.sessionId);
+      if (input.command.type === 'START_AGENT_SESSION') this.sessions.bindStartFingerprint(input.task.id, input.idempotencyKey, JSON.stringify({
         taskId: input.task.id, leaseId: input.command.payload.leaseId,
         agentDefinitionId: input.command.payload.agentDefinitionId,
         correlationId: input.command.correlationId, expectedTaskVersion: input.expectedTaskVersion
       }));
-      this.append(input.event, input.command, input.idempotencyKey, input); this.options.failAt?.('event'); if (input.command) this.options.failAt?.('command');
+      this.append(input.event, input.command, input.idempotencyKey, input); this.sessions.restoreRequestFingerprint(input.idempotencyKey, input.requestFingerprint); this.options.failAt?.('event'); if (input.command) this.options.failAt?.('command');
     }, input.task.id, input.session.sessionId);
     });
   }
@@ -143,7 +147,8 @@ export class InMemorySessionLifecyclePersistence implements SessionLifecyclePers
     await this.atomic(input.idempotencyKey, async () => {
       await this.sessions.save(input.session, input.expectedSessionVersion); this.options.failAt?.('session');
       this.checkpoints.set(input.checkpoint.sessionId, globalThis.structuredClone(input.checkpoint)); this.options.failAt?.('checkpoint');
-      this.append(input.event, null, input.idempotencyKey, input); this.options.failAt?.('event');
+      this.append(input.event, null, input.idempotencyKey, input); this.operationCheckpoints.set(input.idempotencyKey, globalThis.structuredClone(input.checkpoint));
+      this.sessions.restoreRequestFingerprint(input.idempotencyKey, input.requestFingerprint); this.options.failAt?.('event');
     }, null, input.session.sessionId);
     });
   }
@@ -161,7 +166,7 @@ export class InMemorySessionLifecyclePersistence implements SessionLifecyclePers
     this.recordFingerprint(input.idempotencyKey, input);
     await this.atomic(input.idempotencyKey, async () => {
       await this.sessions.save(input.session, input.expectedSessionVersion); this.options.failAt?.('session');
-      this.append(input.event, input.command, input.idempotencyKey, input); this.requests.set(input.idempotencyKey, this.requestForTransition(input)); this.options.failAt?.('event'); if (input.command) this.options.failAt?.('command');
+      this.append(input.event, input.command, input.idempotencyKey, input); this.sessions.restoreRequestFingerprint(input.idempotencyKey, input.requestFingerprint); this.options.failAt?.('event'); if (input.command) this.options.failAt?.('command');
     }, null, input.session.sessionId);
     });
   }
@@ -178,19 +183,19 @@ export class InMemorySessionLifecyclePersistence implements SessionLifecyclePers
     await this.atomic(input.idempotencyKey, async () => {
       await this.tasks.save(input.task, input.expectedTaskVersion); this.options.failAt?.('task');
       await this.sessions.save(input.session, input.expectedSessionVersion); this.options.failAt?.('session');
-      this.append(input.event, null, input.idempotencyKey, input); this.requests.set(input.idempotencyKey, JSON.stringify({ type: 'cancel', sessionId: input.session.sessionId,
-        expectedVersion: input.expectedSessionVersion, reason: input.event.eventType === 'AGENT_SESSION_CANCELLED' ? input.event.payload.reason : '' })); this.options.failAt?.('event');
+      this.append(input.event, null, input.idempotencyKey, input); this.sessions.restoreRequestFingerprint(input.idempotencyKey, input.requestFingerprint); this.options.failAt?.('event');
     }, input.task.id, input.session.sessionId);
     });
   }
 
   public listEvents(): DomainEvent[] { return globalThis.structuredClone(this.events); }
-  public async hasOperation(idempotencyKey: string): Promise<boolean> { return this.operations.has(idempotencyKey); }
   public operationFingerprint(idempotencyKey: string): string | null { return this.operations.get(idempotencyKey) ?? null; }
-  public recordRequest(idempotencyKey: string, fingerprint: string): void { this.requests.set(idempotencyKey, fingerprint); }
-  public requestFingerprint(idempotencyKey: string): string | null { return this.requests.get(idempotencyKey) ?? null; }
+  public requestFingerprint(idempotencyKey: string): string | null { return this.sessions.snapshotRequestFingerprint(idempotencyKey); }
   public operationResult(idempotencyKey: string): { sessionId: AgentSessionId; version: number; attempt: number } | null {
     const value = this.operationResults.get(idempotencyKey); return value ? { ...value } : null;
+  }
+  public operationCheckpoint(idempotencyKey: string): AgentCheckpoint | null {
+    const checkpoint = this.operationCheckpoints.get(idempotencyKey); return checkpoint ? globalThis.structuredClone(checkpoint) : null;
   }
   public listCommands(): OutboxCommand[] { return globalThis.structuredClone(this.commands); }
   public async latestCheckpoint(sessionId: AgentSessionId): Promise<AgentCheckpoint | null> {
@@ -200,27 +205,7 @@ export class InMemorySessionLifecyclePersistence implements SessionLifecyclePers
   public async latest(sessionId: AgentSessionId): Promise<AgentCheckpoint | null> { return this.latestCheckpoint(sessionId); }
   public async save(): Promise<void> { throw new Error('Checkpoint writes must use lifecyclePersistence.checkpoint'); }
 
-  private fingerprint(input: unknown): string {
-    const operation = input as { session?: AgentSession; task?: Task; checkpoint?: AgentCheckpoint; event?: DomainEvent; command?: OutboxCommand | null };
-    return JSON.stringify({
-      taskId: operation.task?.id,
-      taskVersion: operation.task?.version,
-      sessionId: operation.session?.sessionId,
-      sessionVersion: operation.session?.version,
-      checkpointSequence: operation.checkpoint?.sequence,
-      eventId: operation.event?.eventId,
-      commandId: operation.command?.commandId,
-      commandPayload: operation.command?.payload
-    });
-  }
-
-  private requestForTransition(input: Parameters<SessionLifecyclePersistence['transition']>[0]): string {
-    if (input.event.eventType === 'AGENT_SESSION_PAUSED') return JSON.stringify({ type: 'pause', sessionId: input.session.sessionId,
-      expectedVersion: input.expectedSessionVersion, reason: input.event.payload.reason });
-    if (input.event.eventType === 'AGENT_SESSION_RESUMED') return JSON.stringify({ type: 'resume', sessionId: input.session.sessionId,
-      expectedVersion: input.expectedSessionVersion, attempt: input.session.attempt, commandId: input.command?.commandId });
-    return JSON.stringify({ type: input.event.eventType, sessionId: input.session.sessionId, expectedVersion: input.expectedSessionVersion });
-  }
+  private fingerprint(input: unknown): string { return canonicalFingerprint(input); }
 
   private isDuplicate(key: string, input: unknown): boolean {
     const fingerprint = this.fingerprint(input);
@@ -260,29 +245,41 @@ export class InMemorySessionLifecyclePersistence implements SessionLifecyclePers
 
   private async atomic(key: string, operation: () => Promise<void>, taskId: Task['id'] | null, sessionId: AgentSessionId): Promise<void> {
     const oldTask = taskId ? this.tasks.snapshot(taskId) : null;
-    const oldSession = this.sessions instanceof InMemoryAgentSessionRepository ? this.sessions.snapshot(sessionId) : await this.sessions.get(sessionId);
-    const oldIdempotency = taskId && this.sessions instanceof InMemoryAgentSessionRepository
-      ? this.sessions.snapshotIdempotency(taskId, key) : null;
-    const oldStartFingerprint = taskId && this.sessions instanceof InMemoryAgentSessionRepository
-      ? this.sessions.startFingerprint(taskId, key) : null;
+    const oldSession = this.sessions.snapshot(sessionId);
+    const oldIdempotency = taskId ? this.sessions.snapshotIdempotency(taskId, key) : null;
+    const oldStartFingerprint = taskId ? this.sessions.startFingerprint(taskId, key) : null;
+    const oldRequestFingerprint = this.sessions.snapshotRequestFingerprint(key);
     const oldCheckpoint = this.checkpoints.get(sessionId);
     const eventLength = this.events.length; const commandLength = this.commands.length;
     const oldFingerprint = this.operations.get(key);
     const oldResult = this.operationResults.get(key);
-    const oldRequest = this.requests.get(key);
+    const oldOperationCheckpoint = this.operationCheckpoints.get(key);
     try { await operation(); }
     catch (error) {
       if (taskId) this.tasks.restore(taskId, oldTask);
-      if (this.sessions instanceof InMemoryAgentSessionRepository) this.sessions.restore(sessionId, oldSession);
-      if (taskId && this.sessions instanceof InMemoryAgentSessionRepository) this.sessions.restoreIdempotency(taskId, key, oldIdempotency);
-      if (taskId && this.sessions instanceof InMemoryAgentSessionRepository) this.sessions.restoreStartFingerprint(taskId, key, oldStartFingerprint);
+      this.sessions.restore(sessionId, oldSession);
+      if (taskId) this.sessions.restoreIdempotency(taskId, key, oldIdempotency);
+      if (taskId) this.sessions.restoreStartFingerprint(taskId, key, oldStartFingerprint);
+      this.sessions.restoreRequestFingerprint(key, oldRequestFingerprint);
       this.checkpoints.delete(sessionId); if (oldCheckpoint) this.checkpoints.set(sessionId, oldCheckpoint);
       this.events.length = eventLength; this.commands.length = commandLength;
       if (oldFingerprint === undefined) this.operations.delete(key); else this.operations.set(key, oldFingerprint);
       if (oldResult === undefined) this.operationResults.delete(key); else this.operationResults.set(key, oldResult);
-      if (oldRequest === undefined) this.requests.delete(key); else this.requests.set(key, oldRequest);
+      if (oldOperationCheckpoint === undefined) this.operationCheckpoints.delete(key); else this.operationCheckpoints.set(key, oldOperationCheckpoint);
       throw error;
     }
   }
 
 }
+
+export const canonicalFingerprint = (value: unknown): string => {
+  const normalize = (entry: unknown): unknown => {
+    if (entry instanceof Date) return entry.toISOString();
+    if (Array.isArray(entry)) return entry.map(normalize);
+    if (entry !== null && typeof entry === 'object') return Object.fromEntries(
+      Object.entries(entry as Record<string, unknown>).sort(([a], [b]) => a.localeCompare(b)).map(([key, item]) => [key, normalize(item)])
+    );
+    return entry;
+  };
+  return JSON.stringify(normalize(value));
+};

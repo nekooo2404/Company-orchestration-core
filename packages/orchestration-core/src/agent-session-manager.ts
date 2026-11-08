@@ -13,7 +13,7 @@ import {
 import type { Clock } from './leases';
 import { InvalidTaskTransitionError } from './domain-errors';
 import type { CheckpointStore, AgentCheckpoint, AgentCheckpointState } from './checkpoints';
-import type { AgentSessionRepository, SessionLifecyclePersistence, WorkflowStatusReader } from './session-commands';
+import { canonicalFingerprint, type AgentSessionRepository, type SessionLifecyclePersistence, type WorkflowStatusReader } from './session-commands';
 import type { TaskRepository } from './repository';
 import type { DispatchClaimStore } from './ports';
 import { OptimisticConcurrencyError } from './repository';
@@ -44,10 +44,12 @@ export interface LifecycleCommandOptions {
   idempotencyKey: string;
 }
 
+export interface ResumeSessionOptions extends LifecycleCommandOptions { attempt: number }
+
 export interface AgentSessionManager {
   start(input: StartSessionInput): Promise<AgentSession>;
   checkpoint(input: SaveCheckpointInput): Promise<AgentCheckpoint>;
-  resume(sessionId: AgentSessionId, options?: LifecycleCommandOptions): Promise<AgentSession>;
+  resume(sessionId: AgentSessionId, options: ResumeSessionOptions): Promise<AgentSession>;
   pause(sessionId: AgentSessionId, reason: string, options?: LifecycleCommandOptions): Promise<void>;
   cancel(sessionId: AgentSessionId, reason: string, options?: LifecycleCommandOptions): Promise<void>;
 }
@@ -112,13 +114,24 @@ export class AgentSessionManagerService implements AgentSessionManager {
       correlationId: input.correlationId, causationId: transitioned.event.causationId, occurredAt: now,
       payload: { sessionId, taskId: task.id } });
     await this.options.lifecyclePersistence.start({ task: transitioned.task, expectedTaskVersion: task.version, session,
-      expectedSessionVersion: 0, event, command, idempotencyKey: input.idempotencyKey });
+      expectedSessionVersion: 0, event, command, idempotencyKey: input.idempotencyKey,
+      requestFingerprint: this.startFingerprint(input) });
     return session;
   }
 
   public async checkpoint(input: SaveCheckpointInput): Promise<AgentCheckpoint> {
-    const session = await this.requireSession(input.sessionId);
     if (!Number.isSafeInteger(input.expectedSequence) || input.expectedSequence < 0 || !Number.isSafeInteger(input.expectedSessionVersion) || input.expectedSessionVersion < 0 || !input.idempotencyKey.trim()) throw new Error('Checkpoint sequence, expected session version, and idempotency key are required');
+    const requestFingerprint = canonicalFingerprint({ operation: 'checkpoint', sessionId: input.sessionId,
+      expectedSessionVersion: input.expectedSessionVersion, expectedSequence: input.expectedSequence, state: input.state,
+      contextReference: input.contextReference, lastEventId: input.lastEventId,
+      completedOperationKeys: input.completedOperationKeys });
+    if (this.options.lifecyclePersistence.operationFingerprint(input.idempotencyKey) !== null) {
+      if (this.options.lifecyclePersistence.requestFingerprint(input.idempotencyKey) !== requestFingerprint) throw new Error('Checkpoint idempotency key was reused with different input');
+      const prior = this.options.lifecyclePersistence.operationCheckpoint(input.idempotencyKey);
+      if (prior) return prior;
+      throw new Error('Checkpoint operation result is unavailable');
+    }
+    const session = await this.requireSession(input.sessionId);
     if (session.version !== input.expectedSessionVersion) throw new OptimisticConcurrencyError(session.sessionId, input.expectedSessionVersion, session.version);
     const latest = await this.options.checkpointStore.latest(input.sessionId);
     const current = latest?.sequence ?? 0;
@@ -137,30 +150,38 @@ export class AgentSessionManagerService implements AgentSessionManager {
       correlationId: session.traceId, causationId: input.lastEventId, occurredAt: checkpoint.createdAt,
       payload: { sessionId: session.sessionId, reason: 'checkpoint' } });
     await this.options.lifecyclePersistence.checkpoint({ checkpoint, session: updated, expectedSessionVersion: session.version,
-      event, idempotencyKey: input.idempotencyKey ?? `checkpoint:${session.sessionId}:${checkpoint.sequence}` });
+      event, idempotencyKey: input.idempotencyKey, requestFingerprint });
     return checkpoint;
   }
 
-  public async resume(sessionId: AgentSessionId, options: LifecycleCommandOptions): Promise<AgentSession> {
+  public async resume(sessionId: AgentSessionId, options: ResumeSessionOptions): Promise<AgentSession> {
+    if (!options.idempotencyKey.trim() || !Number.isSafeInteger(options.expectedVersion) || options.expectedVersion < 0 || !Number.isSafeInteger(options.attempt) || options.attempt < 1) throw new Error('Resume expectedVersion, attempt, and idempotencyKey are required');
     const session = await this.requireSession(sessionId);
-    if (!options.idempotencyKey.trim() || !Number.isSafeInteger(options.expectedVersion) || options.expectedVersion < 0) throw new Error('Resume expectedVersion and idempotencyKey are required');
+    if (session.state === 'CANCELLED') throw new Error('A cancelled session cannot be resumed');
+    const task = await this.options.taskRepository.get(session.taskId);
+    if (!task || task.workflowId !== session.workflowId || !['RUNNING', 'READY'].includes(task.state) || !await this.options.workflowStatus.isActive(session.workflowId)) {
+      throw new Error('Session task or workflow is no longer active');
+    }
+    const expectedCommandId = `start-agent-session:${sessionId}:attempt:${options.attempt}`;
+    const requestFingerprint = canonicalFingerprint({ operation: 'resume', sessionId, expectedVersion: options.expectedVersion,
+      requestedAttempt: options.attempt, commandId: expectedCommandId });
+    if (this.options.lifecyclePersistence.operationFingerprint(options.idempotencyKey) !== null) {
+      if (this.options.lifecyclePersistence.requestFingerprint(options.idempotencyKey) !== requestFingerprint) throw new Error('Resume idempotency key was reused with different input');
+      const prior = this.options.lifecyclePersistence.operationResult(options.idempotencyKey);
+      if (prior?.sessionId === sessionId && session.state === 'RUNNING' && prior.version === session.version && prior.attempt === options.attempt) return session;
+      throw new Error('Stored resume result does not match the current session');
+    }
     if (session.version !== options.expectedVersion) throw new OptimisticConcurrencyError(sessionId, options.expectedVersion, session.version);
     if (session.state === 'RUNNING') {
-      const result = this.options.lifecyclePersistence.operationResult(options.idempotencyKey);
-      if (result?.sessionId === sessionId && result.version === session.version && result.attempt === session.attempt) return session;
       throw new Error('Running session does not match this resume idempotency key');
     }
-    if (session.state === 'CANCELLED') throw new Error('A cancelled session cannot be resumed');
     if (session.state !== 'PAUSED' && session.state !== 'WAITING_FOR_TOOL') {
       throw new Error(`Session in ${session.state} cannot be resumed`);
-    }
-    const task = await this.options.taskRepository.get(session.taskId);
-    if (!task || task.workflowId !== session.workflowId || !['RUNNING', 'READY'].includes(task.state)) {
-      throw new Error('Session task or workflow is no longer active');
     }
     const checkpoint = await this.options.checkpointStore.latest(sessionId);
     if (!checkpoint) throw new Error('Cannot resume without a checkpoint');
     const attempt = (session.attempt ?? 1) + 1;
+    if (options.attempt !== attempt) throw new Error(`Requested resume attempt must be ${attempt}`);
     const now = this.options.clock.now();
     const updated = AgentSessionSchema.parse({ ...session, state: 'RUNNING', attempt,
       version: session.version + 1, updatedAt: now });
@@ -176,13 +197,12 @@ export class AgentSessionManagerService implements AgentSessionManager {
       correlationId: session.traceId, causationId: checkpoint.lastEventId, occurredAt: now,
       payload: { sessionId } });
     try {
-    await this.options.lifecyclePersistence.transition({ session: updated, expectedSessionVersion: session.version, event, command, expectedTaskVersion: null,
-        idempotencyKey: operationKey });
+      await this.options.lifecyclePersistence.transition({ session: updated, expectedSessionVersion: session.version, event, command, expectedTaskVersion: null,
+        idempotencyKey: operationKey, requestFingerprint });
     } catch (error) {
-      if (!(error instanceof OptimisticConcurrencyError)) throw error;
       const current = await this.requireSession(sessionId);
       const winning = this.options.lifecyclePersistence.operationResult(operationKey);
-      if (current.state === 'RUNNING' && winning?.sessionId === sessionId && winning.attempt === current.attempt && winning.version === current.version) return current;
+      if (this.options.lifecyclePersistence.requestFingerprint(operationKey) === requestFingerprint && current.state === 'RUNNING' && winning?.sessionId === sessionId && winning.attempt === options.attempt && winning.version === current.version) return current;
       throw error;
     }
     return updated;
@@ -192,9 +212,9 @@ export class AgentSessionManagerService implements AgentSessionManager {
     if (!reason.trim()) throw new Error('Pause reason is required');
     const session = await this.requireSession(sessionId);
     if (session.state === 'PAUSED') {
-      if (session.version !== options.expectedVersion) throw new OptimisticConcurrencyError(sessionId, options.expectedVersion + 1, session.version);
+      if (session.version !== options.expectedVersion + 1) throw new OptimisticConcurrencyError(sessionId, options.expectedVersion + 1, session.version);
       const request = this.options.lifecyclePersistence.requestFingerprint(options.idempotencyKey);
-      if (request === JSON.stringify({ type: 'pause', sessionId, expectedVersion: options.expectedVersion - 1, reason })) return;
+      if (request === canonicalFingerprint({ operation: 'pause', sessionId, expectedVersion: options.expectedVersion, reason })) return;
       throw new Error('Idempotency key was reused with different input');
     }
     this.validateLifecycleOptions(sessionId, session.version, options);
@@ -202,23 +222,25 @@ export class AgentSessionManagerService implements AgentSessionManager {
     const now = this.options.clock.now();
     const updated = AgentSessionSchema.parse({ ...session, state: 'PAUSED', version: session.version + 1, updatedAt: now });
     const latest = await this.options.checkpointStore.latest(sessionId);
+    const requestFingerprint = canonicalFingerprint({ operation: 'pause', sessionId, expectedVersion: session.version, reason });
     const event = DomainEventSchema.parse({ eventId: this.newEventId(), aggregateType: 'AGENT_SESSION',
       aggregateId: sessionId, aggregateVersion: updated.version, eventType: 'AGENT_SESSION_PAUSED', actor,
       correlationId: session.traceId, causationId: latest?.lastEventId ?? this.newEventId(), occurredAt: now,
       payload: { sessionId, reason } });
     await this.options.lifecyclePersistence.transition({ session: updated, expectedSessionVersion: session.version, event, command: null, expectedTaskVersion: null,
-      idempotencyKey: options.idempotencyKey });
+      idempotencyKey: options.idempotencyKey, requestFingerprint });
   }
 
   public async cancel(sessionId: AgentSessionId, reason: string, options: LifecycleCommandOptions): Promise<void> {
     if (!reason.trim()) throw new Error('Cancellation reason is required');
     const session = await this.requireSession(sessionId);
-    this.validateLifecycleOptions(sessionId, session.version, options);
     if (session.state === 'CANCELLED') {
       const request = this.options.lifecyclePersistence.requestFingerprint(options.idempotencyKey);
-      if (request === JSON.stringify({ type: 'cancel', sessionId, expectedVersion: options.expectedVersion - 1, reason })) return;
+      if (session.version !== options.expectedVersion + 1) throw new OptimisticConcurrencyError(sessionId, options.expectedVersion + 1, session.version);
+      if (request === canonicalFingerprint({ operation: 'cancel', sessionId, expectedVersion: options.expectedVersion, reason })) return;
       throw new Error('Cancelled session does not match this cancellation idempotency key');
     }
+    this.validateLifecycleOptions(sessionId, session.version, options);
     if (await this.options.hasPendingCleanup?.(sessionId)) throw new Error('Session cancellation is blocked while dependent cleanup is pending');
     const task = await this.options.taskRepository.get(session.taskId);
     if (!task) throw new Error(`Task ${session.taskId} does not exist`);
@@ -234,8 +256,9 @@ export class AgentSessionManagerService implements AgentSessionManager {
       payload: { sessionId, reason }
     });
     const cancelledSession = AgentSessionSchema.parse({ ...session, state: 'CANCELLED', version: session.version + 1, updatedAt: now });
+    const requestFingerprint = canonicalFingerprint({ operation: 'cancel', sessionId, expectedVersion: session.version, reason });
     await this.options.lifecyclePersistence.cancel({ task: transitioned.task, expectedTaskVersion: task.version,
-      session: cancelledSession, expectedSessionVersion: session.version, event, idempotencyKey: options.idempotencyKey });
+      session: cancelledSession, expectedSessionVersion: session.version, event, idempotencyKey: options.idempotencyKey, requestFingerprint });
   }
 
   private async requireSession(sessionId: AgentSessionId): Promise<AgentSession> {

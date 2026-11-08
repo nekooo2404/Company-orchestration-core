@@ -65,7 +65,7 @@ describe('agent session lifecycle', () => {
     const checkpoint = await h.manager.checkpoint({ sessionId: started.sessionId, expectedSequence: 0, expectedSessionVersion: 0, idempotencyKey: 'checkpoint:one', state: 'WAITING_FOR_TOOL', contextReference: 'ctx:1', lastEventId: eventId('event-1'), completedOperationKeys: ['tool:charge:1'] });
     expect(checkpoint.sequence).toBe(1);
     await h.manager.pause(started.sessionId, 'checkpoint', { expectedVersion: 1, idempotencyKey: 'pause:checkpoint' });
-    const resumed = await h.manager.resume(started.sessionId, { expectedVersion: 2, idempotencyKey: 'resume:session-1:2' });
+    const resumed = await h.manager.resume(started.sessionId, { expectedVersion: 2, attempt: 2, idempotencyKey: 'resume:session-1:2' });
     expect(resumed.sessionId).toBe(started.sessionId);
     expect(resumed.attempt).toBe(2);
     expect(h.commands).toHaveLength(2);
@@ -77,7 +77,7 @@ describe('agent session lifecycle', () => {
     const h = setup(); await h.tasks.save(task, 0); await h.lease();
     const session = await h.manager.start({ taskId: task.id, leaseId: 'lease-1', agentDefinitionId: agentDefinitionId('agent-1'), correlationId: task.traceId, expectedTaskVersion: 0, idempotencyKey: 'session:session-1' });
     await h.manager.pause(session.sessionId, 'operator request', { expectedVersion: 0, idempotencyKey: 'pause:operator' });
-    await h.manager.pause(session.sessionId, 'operator request', { expectedVersion: 1, idempotencyKey: 'pause:operator' });
+    await h.manager.pause(session.sessionId, 'operator request', { expectedVersion: 0, idempotencyKey: 'pause:operator' });
     expect((await h.sessions.get(session.sessionId))?.state).toBe('PAUSED');
     expect((await h.tasks.get(task.id))?.state).toBe('RUNNING');
   });
@@ -91,7 +91,7 @@ describe('agent session lifecycle', () => {
     const h = setup(); await h.tasks.save(task, 0); await h.lease();
     const second = await h.manager.start({ taskId: task.id, leaseId: 'lease-1', agentDefinitionId: agentDefinitionId('agent-1'), correlationId: task.traceId, expectedTaskVersion: 0, idempotencyKey: 'session:session-1' });
     await h.manager.cancel(second.sessionId, 'stop', { expectedVersion: 0, idempotencyKey: 'cancel:stop' });
-    await h.manager.cancel(second.sessionId, 'stop', { expectedVersion: 1, idempotencyKey: 'cancel:stop' });
+    await h.manager.cancel(second.sessionId, 'stop', { expectedVersion: 0, idempotencyKey: 'cancel:stop' });
     expect((await h.sessions.get(second.sessionId))?.state).toBe('CANCELLED');
     expect((await h.tasks.get(task.id))?.state).toBe('CANCELLED');
   });
@@ -100,7 +100,7 @@ describe('agent session lifecycle', () => {
     const h = setup(); await h.tasks.save(task, 0); await h.lease();
     const session = await h.manager.start({ taskId: task.id, leaseId: 'lease-1', agentDefinitionId: agentDefinitionId('agent-1'), correlationId: task.traceId, expectedTaskVersion: 0, idempotencyKey: 'session:session-1' });
     await h.manager.cancel(session.sessionId, 'stop', { expectedVersion: 0, idempotencyKey: 'cancel:stop' });
-    await expect(h.manager.resume(session.sessionId, { expectedVersion: 1, idempotencyKey: 'resume:session-1:2' })).rejects.toThrow(/cancelled/i);
+    await expect(h.manager.resume(session.sessionId, { expectedVersion: 1, attempt: 2, idempotencyKey: 'resume:session-1:2' })).rejects.toThrow(/cancelled/i);
   });
 
   it('rejects missing, stale, and wrong dispatch leases', async () => {
@@ -135,23 +135,39 @@ describe('agent session lifecycle', () => {
     expect((await h.lifecycle.latest(session.sessionId))?.completedOperationKeys).toEqual(['charged']);
   });
 
+  it('returns the stored checkpoint for an exact retry using the original session version', async () => {
+    const h = setup(); await h.tasks.save(task, 0); await h.lease();
+    const session = await h.manager.start({ taskId: task.id, leaseId: 'lease-1', agentDefinitionId: agentDefinitionId('agent-1'), correlationId: task.traceId, expectedTaskVersion: 0, idempotencyKey: 'session:session-1' });
+    const input = { sessionId: session.sessionId, expectedSequence: 0, expectedSessionVersion: 0, idempotencyKey: 'checkpoint:retry',
+      state: 'WAITING_FOR_TOOL' as const, contextReference: 'ctx', lastEventId: eventId('checkpoint-event'), completedOperationKeys: ['charge:1'] };
+    const saved = await h.manager.checkpoint(input);
+    const eventCount = h.lifecycle.listEvents().length;
+    const current = await h.sessions.get(session.sessionId);
+    await expect(h.manager.checkpoint(input)).resolves.toEqual(saved);
+    expect((await h.sessions.get(session.sessionId))?.version).toBe(current?.version);
+    expect(h.lifecycle.listEvents()).toHaveLength(eventCount);
+    await expect(h.manager.checkpoint({ ...input, contextReference: 'changed' })).rejects.toThrow(/different input/i);
+  });
+
   it('makes resume idempotent for repeated and concurrent calls and publishes once', async () => {
     const h = setup(); await h.tasks.save(task, 0); await h.lease();
     const session = await h.manager.start({ taskId: task.id, leaseId: 'lease-1', agentDefinitionId: agentDefinitionId('agent-1'), correlationId: task.traceId, expectedTaskVersion: 0, idempotencyKey: 'session:session-1' });
     await h.manager.checkpoint({ sessionId: session.sessionId, expectedSequence: 0, expectedSessionVersion: 0, idempotencyKey: 'ck1', state: 'PAUSED', contextReference: 'ctx', lastEventId: eventId('e1'), completedOperationKeys: ['op'] });
-    const resumeOptions = { expectedVersion: 1, idempotencyKey: 'resume:session-1:2' };
+    const resumeOptions = { expectedVersion: 1, attempt: 2, idempotencyKey: 'resume:session-1:2' };
     const results = await Promise.all([h.manager.resume(session.sessionId, resumeOptions), h.manager.resume(session.sessionId, resumeOptions)]);
     expect(results.every((item) => item.state === 'RUNNING' && item.attempt === 2)).toBe(true);
     expect(h.commands).toHaveLength(2);
-    expect(await h.manager.resume(session.sessionId, { expectedVersion: 2, idempotencyKey: resumeOptions.idempotencyKey })).toEqual(results[0]);
+    expect(await h.manager.resume(session.sessionId, resumeOptions)).toEqual(results[0]);
     expect(h.commands).toHaveLength(2);
+    await expect(h.manager.resume(session.sessionId, { ...resumeOptions, expectedVersion: 2 })).rejects.toThrow(/different input/i);
+    await expect(h.manager.resume(session.sessionId, { ...resumeOptions, attempt: 3 })).rejects.toThrow(/different input/i);
   });
 
   it('rejects stale expected session versions without publishing a command', async () => {
     const h = setup(); await h.tasks.save(task, 0); await h.lease();
     const session = await h.manager.start({ taskId: task.id, leaseId: 'lease-1', agentDefinitionId: agentDefinitionId('agent-1'), correlationId: task.traceId, expectedTaskVersion: 0, idempotencyKey: 'session:session-1' });
     await h.manager.checkpoint({ sessionId: session.sessionId, expectedSequence: 0, expectedSessionVersion: 0, idempotencyKey: 'ck1', state: 'PAUSED', contextReference: 'ctx', lastEventId: eventId('e1'), completedOperationKeys: ['op'] });
-    await expect(h.manager.resume(session.sessionId, { expectedVersion: 0, idempotencyKey: 'resume:session-1:2' })).rejects.toBeInstanceOf(OptimisticConcurrencyError);
+    await expect(h.manager.resume(session.sessionId, { expectedVersion: 0, attempt: 2, idempotencyKey: 'resume:session-1:2' })).rejects.toBeInstanceOf(OptimisticConcurrencyError);
     expect(h.commands).toHaveLength(1);
   });
 
@@ -186,7 +202,7 @@ describe('agent session lifecycle', () => {
     const started = await h.manager.start(input);
     await expect(h.manager.start(input)).resolves.toEqual(started);
     await h.manager.pause(started.sessionId, 'hold', { expectedVersion: 0, idempotencyKey: 'pause:key' });
-    await expect(h.manager.pause(started.sessionId, 'changed', { expectedVersion: 1, idempotencyKey: 'pause:key' })).rejects.toThrow(/different input/i);
+    await expect(h.manager.pause(started.sessionId, 'changed', { expectedVersion: 0, idempotencyKey: 'pause:key' })).rejects.toThrow(/different input/i);
   });
 });
 
