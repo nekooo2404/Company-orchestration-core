@@ -5,6 +5,7 @@ import {
   type ActorRef,
   type AgentSessionId,
   type ApprovalId,
+  type ApprovalRecord,
   type DomainEvent,
   type Task,
   type TaskState
@@ -21,7 +22,9 @@ export type TaskTransition =
   | { type: 'RECOVERY_STARTED'; recoveryId: string }
   | { type: 'TASK_ESCALATED'; reason: string }
   | { type: 'TASK_CANCELLED'; reason: string }
-  | { type: 'APPROVAL_REQUESTED'; approvalId: ApprovalId };
+  | { type: 'APPROVAL_REQUESTED'; approvalId: ApprovalId }
+  | { type: 'DEPLOYMENT_APPROVED'; approvalId: ApprovalId; approvalRecord: ApprovalRecord }
+  | { type: 'DEPLOYMENT_REJECTED'; approvalId: ApprovalId; reason: string; approvalRecord: ApprovalRecord };
 
 export interface TransitionContext {
   actor: ActorRef;
@@ -61,7 +64,7 @@ const TRANSITION_TABLE: Readonly<Record<TaskState, ReadonlySet<TransitionType>>>
   FAILED: transitions('RECOVERY_STARTED', 'TASK_CANCELLED'),
   ESCALATED_TO_CEO: transitions(),
   CANCELLED: transitions(),
-  WAITING_FOR_APPROVAL: transitions('TASK_CANCELLED')
+  WAITING_FOR_APPROVAL: transitions('TASK_CANCELLED', 'DEPLOYMENT_APPROVED', 'DEPLOYMENT_REJECTED')
 };
 
 const nonEmpty = (value: string): boolean => value.trim().length > 0;
@@ -231,6 +234,20 @@ export function transitionTask(
       nextState = 'WAITING_FOR_APPROVAL';
       eventType = 'DEPLOYMENT_APPROVAL_REQUESTED';
       payload = { approvalId: transition.approvalId, taskId: task.id };
+      break;
+    case 'DEPLOYMENT_APPROVED':
+      if (!isDeployment || transition.approvalRecord.state !== 'APPROVED' || transition.approvalRecord.subjectType !== 'DEPLOYMENT' || transition.approvalRecord.subjectId !== task.id || transition.approvalRecord.approvalId !== transition.approvalId) {
+        invalid(task, transition, 'an approved deployment record matching this task is required');
+      }
+      nextState = 'COMPLETED';
+      eventType = 'TASK_COMPLETED';
+      payload = { evidenceIds: [`approval:${transition.approvalId}`], taskId: task.id };
+      break;
+    case 'DEPLOYMENT_REJECTED':
+      if (!isDeployment || !nonEmpty(transition.reason) || transition.approvalRecord.state !== 'REJECTED' || transition.approvalRecord.subjectType !== 'DEPLOYMENT' || transition.approvalRecord.subjectId !== task.id || transition.approvalRecord.approvalId !== transition.approvalId) invalid(task, transition, 'a rejected deployment record matching this task and a reason are required');
+      nextState = 'REVIEW';
+      eventType = 'APPROVAL_REJECTED';
+      payload = { approvalId: transition.approvalId, reason: transition.reason };
       break;
   }
 

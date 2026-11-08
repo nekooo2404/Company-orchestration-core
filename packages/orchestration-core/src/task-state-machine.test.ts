@@ -6,6 +6,7 @@ import {
   agentSessionId,
   approvalId,
   correlationId,
+  eventId,
   taskId,
   workflowId
 } from '@aicompany/contracts';
@@ -182,6 +183,18 @@ describe('transitionTask', () => {
       approvalId: 'approval-1',
       taskId: 'task-1'
     });
+  });
+
+  it('requires a matching approved deployment record before deployment completion', () => {
+    const deployment = makeTask({ state: 'WAITING_FOR_APPROVAL', isDeployment: true });
+    const pendingApproval = {
+      approvalId: approvalId('approval-1'), subjectType: 'DEPLOYMENT' as const, subjectId: deployment.id,
+      reason: 'Release', requestedBy: context.actor, correlationId: deployment.traceId,
+      causationId: eventId('request-approval'), version: 0, createdAt: now, updatedAt: now,
+      state: 'PENDING' as const, decision: null, decidedBy: null, decidedAt: null
+    };
+    expect(() => transitionTask(deployment, { type: 'DEPLOYMENT_APPROVED', approvalId: pendingApproval.approvalId, approvalRecord: pendingApproval }, { ...context, isDeployment: true }))
+      .toThrow(/approved deployment record/i);
   });
 
   it('only escalates a recovering task after the fifth recovery cycle', () => {
