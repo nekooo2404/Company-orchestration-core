@@ -44,6 +44,15 @@ CREATE TABLE IF NOT EXISTS agent_sessions (
   updated_at timestamptz NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS task_dispatch_claims (
+  task_id text PRIMARY KEY REFERENCES tasks(task_id) ON DELETE CASCADE,
+  worker_id text NOT NULL,
+  agent_definition_id text NOT NULL,
+  lease_id text NOT NULL UNIQUE,
+  expires_at timestamptz NOT NULL,
+  session_id text
+);
+
 CREATE TABLE IF NOT EXISTS domain_events (
   event_id text PRIMARY KEY,
   aggregate_type text NOT NULL,

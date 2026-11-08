@@ -23,6 +23,26 @@ export interface SaveTaskAndAppendInput {
 
 export interface TransactionalPersistence {
   saveTaskAndAppend(input: SaveTaskAndAppendInput): Promise<void>;
+  claimDispatch(input: DispatchClaimRequest): Promise<DispatchClaim | null>;
+  releaseDispatch(taskId: Task['id'], workerId: string, leaseId: string): Promise<boolean>;
+}
+
+export interface DispatchClaimRequest {
+  taskId: Task['id'];
+  workerId: string;
+  agentDefinitionId: NonNullable<Task['ownerAgentDefinitionId']>;
+  leaseId: string;
+  now: Date;
+  expiresAt: Date;
+}
+
+export interface DispatchClaim extends DispatchClaimRequest {
+  sessionId: string | null;
+}
+
+export interface DispatchClaimStore {
+  claimDispatch(input: DispatchClaimRequest): Promise<DispatchClaim | null>;
+  releaseDispatch(taskId: Task['id'], workerId: string, leaseId: string): Promise<boolean>;
 }
 
 export interface Outbox {

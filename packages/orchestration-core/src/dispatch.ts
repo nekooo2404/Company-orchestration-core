@@ -3,6 +3,7 @@ import {
   type AgentSession,
   type AgentSessionId,
   type CorrelationId,
+  agentSessionId,
   type OutboxCommand,
   type Task,
   type TaskId
@@ -16,6 +17,7 @@ export interface LaunchAgentSessionInput {
   workflowId: Task['workflowId'];
   agentDefinitionId: AgentDefinitionId;
   leaseId: string;
+  sessionId: AgentSessionId;
   correlationId: CorrelationId;
 }
 
@@ -57,6 +59,11 @@ export interface DispatchTaskInput {
   task: Task;
   agentDefinitionId: AgentDefinitionId;
   lease: Lease;
+}
+
+export interface DispatchResult {
+  decision: DispatchDecision | null;
+  releaseClaim: boolean;
 }
 
 const systemActor = { kind: 'SYSTEM' as const, name: 'scheduler' };
@@ -108,13 +115,14 @@ const recoveryCommand = (
 export class TaskDispatcher {
   public constructor(private readonly options: DispatchOptions) {}
 
-  public async dispatch(input: DispatchTaskInput): Promise<DispatchDecision | null> {
+  public async dispatch(input: DispatchTaskInput): Promise<DispatchResult> {
     const { task, agentDefinitionId, lease } = input;
     const launchInput: LaunchAgentSessionInput = {
       taskId: task.id,
       workflowId: task.workflowId,
       agentDefinitionId,
       leaseId: lease.leaseId,
+      sessionId: agentSessionId(`session:${lease.leaseId}`),
       correlationId: task.traceId
     };
 
@@ -123,7 +131,7 @@ export class TaskDispatcher {
       session = await this.options.launcher.launch(launchInput);
     } catch (error) {
       await this.persistFailure(task, lease, failureFingerprint(error));
-      return null;
+      return { decision: null, releaseClaim: true };
     }
 
     const context = {
@@ -153,17 +161,21 @@ export class TaskDispatcher {
         commands: [command]
       });
     } catch (error) {
-      await this.options.launcher.stop(session.sessionId, 'dispatch persistence failed').catch(() => undefined);
-      throw error;
+      try {
+        await this.options.launcher.stop(launchInput.sessionId, 'dispatch persistence failed');
+        return { decision: null, releaseClaim: true };
+      } catch (stopError) {
+        throw new AggregateError([error, stopError], 'Dispatch persistence and provider cleanup both failed');
+      }
     }
 
-    return {
+    return { decision: {
       taskId: task.id,
       agentDefinitionId,
       leaseId: lease.leaseId,
       expiresAt: new Date(lease.expiresAt),
       correlationId: task.traceId
-    };
+    }, releaseClaim: false };
   }
 
   private async persistFailure(

@@ -13,6 +13,7 @@ import {
   FairQueue,
   InMemoryOutbox,
   InMemoryTaskRepository,
+  InMemoryDispatchClaimStore,
   LeaseManager,
   TaskScheduler,
   findReadyTasks,
@@ -21,6 +22,7 @@ import {
   type LaunchAgentSessionInput,
   type RecoveryRequest,
   type SaveTaskAndAppendInput,
+  type DispatchClaimRequest,
   type TransactionalPersistence
 } from './index';
 
@@ -101,6 +103,8 @@ class TestClock implements Clock {
 class TestLauncher implements AgentSessionLauncher {
   public readonly calls: LaunchAgentSessionInput[] = [];
   public readonly failures = new Set<string>();
+  public stopFailure = false;
+  public readonly stops: string[] = [];
 
   public async launch(input: LaunchAgentSessionInput): Promise<AgentSession> {
     this.calls.push(input);
@@ -110,15 +114,18 @@ class TestLauncher implements AgentSessionLauncher {
     return makeSession(input);
   }
 
-  public async stop(): Promise<void> {}
+  public async stop(sessionId: string): Promise<void> {
+    this.stops.push(sessionId);
+    if (this.stopFailure) throw new Error('provider stop failed');
+  }
 }
 
 class TestTransactionalPersistence implements TransactionalPersistence {
   public readonly calls: SaveTaskAndAppendInput[] = [];
-
   public constructor(
     private readonly repository: InMemoryTaskRepository,
-    private readonly outbox: InMemoryOutbox
+    private readonly outbox: InMemoryOutbox,
+    private readonly claims = new InMemoryDispatchClaimStore()
   ) {}
 
   public async saveTaskAndAppend(input: SaveTaskAndAppendInput): Promise<void> {
@@ -127,6 +134,11 @@ class TestTransactionalPersistence implements TransactionalPersistence {
     for (const command of input.commands) {
       await this.outbox.enqueue(command);
     }
+  }
+
+  public claimDispatch(input: DispatchClaimRequest) { return this.claims.claimDispatch(input); }
+  public releaseDispatch(taskId: Task['id'], workerId: string, leaseId: string) {
+    return this.claims.releaseDispatch(taskId, workerId, leaseId);
   }
 }
 
@@ -272,6 +284,85 @@ describe('scheduler dispatch', () => {
     expect(beforeExpiry.leaseId).toBe(first.leaseId);
     expect(afterExpiry.leaseId).not.toBe(first.leaseId);
     expect(afterExpiry.expiresAt.getTime()).toBe(clock.current.getTime() + 1_000);
+  });
+
+  it('shares a durable claim across scheduler instances and reclaims it with the same lease after expiry', async () => {
+    const clock = new TestClock();
+    const task = makeTask('task-shared');
+    const repository = new InMemoryTaskRepository();
+    await seed(repository, [task]);
+    const outbox = new InMemoryOutbox({ now: () => clock.current });
+    const claimStore = new InMemoryDispatchClaimStore();
+    const persistA = new TestTransactionalPersistence(repository, outbox, claimStore);
+    const persistB = new TestTransactionalPersistence(repository, outbox, claimStore);
+    const launcher = new TestLauncher();
+    const makeInstance = (persistence: TestTransactionalPersistence) => new TaskScheduler({
+      taskRepository: repository, transactionalPersistence: persistence, outbox, launcher, clock,
+      agentDefinitions: [makeAgent('agent-default', 'engineering')]
+    });
+    const a = makeInstance(persistA);
+    const b = makeInstance(persistB);
+    const [first, second] = await Promise.all([
+      a.tick({ workflowId: task.workflowId, capacity: 1, workerId: 'worker-a' }),
+      b.tick({ workflowId: task.workflowId, capacity: 1, workerId: 'worker-b' })
+    ]);
+    expect(first.length + second.length).toBe(1);
+    expect(launcher.calls).toHaveLength(1);
+    expect(await claimStore.claimDispatch({
+      taskId: task.id, workerId: 'worker-b', agentDefinitionId: agentDefinitionId('agent-default'),
+      leaseId: 'irrelevant-new-id', now: new Date(now.getTime() + 5 * 60_001),
+      expiresAt: new Date(now.getTime() + 10 * 60_000)
+    })).toMatchObject({ leaseId: (first[0] ?? second[0]).leaseId, workerId: 'worker-b' });
+  });
+
+  it('does not dispatch without configured agent definitions', async () => {
+    const task = makeTask('no-agent');
+    const harness = makeScheduler({ tasks: [task], agents: [] });
+    await seed(harness.repository, [task]);
+    expect(await harness.scheduler.tick({ workflowId: task.workflowId, capacity: 1, workerId: 'worker-a' })).toEqual([]);
+    expect(harness.launcher.calls).toHaveLength(0);
+  });
+
+  it('retains an owned claim when persistence fails and provider stop fails', async () => {
+    const task = makeTask('cleanup-failure');
+    const repository = new InMemoryTaskRepository();
+    await seed(repository, [task]);
+    const outbox = new InMemoryOutbox({ now: () => now });
+    const claims = new InMemoryDispatchClaimStore();
+    const base = new TestTransactionalPersistence(repository, outbox, claims);
+    const persistence: TransactionalPersistence = {
+      ...base,
+      saveTaskAndAppend: async (input) => {
+        if (input.commands.some(({ type }) => type === 'START_AGENT_SESSION')) throw new Error('db unavailable');
+        await base.saveTaskAndAppend(input);
+      },
+      claimDispatch: (input) => base.claimDispatch(input),
+      releaseDispatch: (id, worker, lease) => base.releaseDispatch(id, worker, lease)
+    };
+    const launcher = new TestLauncher();
+    launcher.stopFailure = true;
+    const scheduler = new TaskScheduler({
+      taskRepository: repository, transactionalPersistence: persistence, outbox, launcher,
+      clock: new TestClock(), agentDefinitions: [makeAgent('agent-default', 'engineering')]
+    });
+    await expect(scheduler.tick({ workflowId: task.workflowId, capacity: 1, workerId: 'worker-a' })).rejects.toThrow(/cleanup/);
+    const claim = await claims.claimDispatch({
+      taskId: task.id, workerId: 'worker-b', agentDefinitionId: agentDefinitionId('agent-default'),
+      leaseId: 'new-id', now: now, expiresAt: new Date(now.getTime() + 1000)
+    });
+    expect(claim).toBeNull();
+    expect(launcher.stops).toEqual([`session:dispatch:${task.id}`]);
+  });
+
+  it('checks worker ownership when releasing a claim', async () => {
+    const claims = new InMemoryDispatchClaimStore();
+    const input: DispatchClaimRequest = {
+      taskId: taskId('owned'), workerId: 'worker-a', agentDefinitionId: agentDefinitionId('agent-default'),
+      leaseId: 'lease-owned', now, expiresAt: new Date(now.getTime() + 1000)
+    };
+    expect(await claims.claimDispatch(input)).not.toBeNull();
+    expect(await claims.releaseDispatch(input.taskId, 'worker-b', input.leaseId)).toBe(false);
+    expect(await claims.releaseDispatch(input.taskId, input.workerId, input.leaseId)).toBe(true);
   });
 
   it('marks a rejected launch failed, requests one recovery and continues unrelated tasks', async () => {

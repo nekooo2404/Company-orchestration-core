@@ -1,13 +1,12 @@
 import {
   type AgentDefinition,
   type AgentDefinitionId,
-  type Task,
-  agentDefinitionId
+  type Task
 } from '@aicompany/contracts';
 import { findReadyTasks } from './task-graph';
 import { transitionTask } from './task-state-machine';
 import { FairQueue, type FairQueueEntry, type FairQueueOptions } from './fair-queue';
-import { LeaseManager } from './leases';
+import type { Lease } from './leases';
 import type { TaskRepository } from './repository';
 import type {
   AgentSessionLauncher,
@@ -51,7 +50,6 @@ export interface SchedulerOptions extends DispatchOptions {
   budgetPolicy?: BudgetPolicy;
   providerHealth?: ProviderHealth | (() => boolean | Promise<boolean>);
   providerHealthy?: () => boolean | Promise<boolean>;
-  leaseManager?: LeaseManager;
   leaseDurationMs?: number;
   fairQueue?: FairQueueOptions;
   recoveryCoordinator?: RecoveryCoordinator;
@@ -102,17 +100,8 @@ const asProviderHealth = (
     : () => providerHealth.isHealthy();
 };
 
-const fallbackAgent = (task: Task): SchedulerAgentDefinition => ({
-  id: task.ownerAgentDefinitionId ?? agentDefinitionId('scheduler-default'),
-  department: 'default',
-  allowedCapabilities: task.requiredCapabilities,
-  budget: task.budget,
-  maxConcurrency: Number.MAX_SAFE_INTEGER
-});
-
 export class SchedulerService implements Scheduler {
   private readonly agents: readonly SchedulerAgentDefinition[];
-  private readonly leases: LeaseManager;
   private readonly queue: FairQueue;
   private readonly dispatcher: TaskDispatcher;
   private readonly providerIsHealthy: () => boolean | Promise<boolean>;
@@ -122,10 +111,6 @@ export class SchedulerService implements Scheduler {
   public constructor(private readonly options: SchedulerOptions) {
     this.agents = [...(options.agentDefinitions ?? options.agents ?? [])]
       .sort((left, right) => left.department.localeCompare(right.department) || left.id.localeCompare(right.id));
-    const leaseOptions = { clock: options.clock, ...(options.leaseDurationMs === undefined
-      ? {}
-      : { durationMs: options.leaseDurationMs }) };
-    this.leases = options.leaseManager ?? new LeaseManager(leaseOptions);
     this.queue = new FairQueue(options.fairQueue);
     const dispatchOptions: DispatchOptions = {
       transactionalPersistence: options.transactionalPersistence,
@@ -193,7 +178,7 @@ export class SchedulerService implements Scheduler {
 
     const selected = this.queue.take(candidates, input.capacity);
     const results = await Promise.all(
-      selected.map((entry) => this.dispatchOne(entry.task, agentByTask.get(entry.task.id)!))
+      selected.map((entry) => this.dispatchOne(entry.task, agentByTask.get(entry.task.id)!, input.workerId))
     );
     return results.filter((decision): decision is DispatchDecision => decision !== null);
   }
@@ -203,7 +188,7 @@ export class SchedulerService implements Scheduler {
     activeByAgent: ReadonlyMap<AgentDefinitionId, number>,
     plannedByAgent: ReadonlyMap<AgentDefinitionId, number>
   ): Promise<SchedulerAgentDefinition | null> {
-    const possibleAgents = this.agents.length > 0 ? this.agents : [fallbackAgent(task)];
+    const possibleAgents = this.agents;
     const eligible: SchedulerAgentDefinition[] = [];
     for (const agent of possibleAgents) {
       if (task.ownerAgentDefinitionId !== null && task.ownerAgentDefinitionId !== agent.id) {
@@ -233,17 +218,24 @@ export class SchedulerService implements Scheduler {
 
   private async dispatchOne(
     task: Task,
-    agent: SchedulerAgentDefinition
+    agent: SchedulerAgentDefinition,
+    workerId: string
   ): Promise<DispatchDecision | null> {
     const agentDefinitionIdValue = agent.id;
-    const currentLease = this.leases.current(task.id);
-    if (currentLease !== null) {
-      return null;
-    }
-    const lease = this.leases.acquire(task.id);
+    const now = this.options.clock.now();
+    const durationMs = this.options.leaseDurationMs ?? 5 * 60 * 1000;
+    const claim = await this.options.transactionalPersistence.claimDispatch({
+      taskId: task.id,
+      workerId,
+      agentDefinitionId: agentDefinitionIdValue,
+      leaseId: `dispatch:${task.id}`,
+      now,
+      expiresAt: new Date(now.getTime() + durationMs)
+    });
+    if (claim === null) return null;
+    const lease: Lease = { taskId: task.id, leaseId: claim.leaseId, expiresAt: claim.expiresAt };
 
-    try {
-      const assignedTask = task.ownerAgentDefinitionId === null
+    const assignedTask = task.ownerAgentDefinitionId === null
         ? { ...task, ownerAgentDefinitionId: agentDefinitionIdValue }
         : task;
       let readyTask = assignedTask;
@@ -262,19 +254,15 @@ export class SchedulerService implements Scheduler {
         });
         readyTask = ready.task;
       }
-      const decision = await this.dispatcher.dispatch({
+      const result = await this.dispatcher.dispatch({
         task: readyTask,
         agentDefinitionId: agentDefinitionIdValue,
         lease
       });
-      if (decision === null) {
-        this.leases.release(task.id, lease.leaseId);
+      if (result.releaseClaim) {
+        await this.options.transactionalPersistence.releaseDispatch(task.id, workerId, lease.leaseId);
       }
-      return decision;
-    } catch {
-      this.leases.release(task.id, lease.leaseId);
-      return null;
-    }
+    return result.decision;
   }
 }
 

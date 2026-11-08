@@ -13,6 +13,8 @@ import {
   OptimisticConcurrencyError,
   type EventStore,
   type SaveTaskAndAppendInput,
+  type DispatchClaim,
+  type DispatchClaimRequest,
   type TransactionalPersistence
 } from '@aicompany/orchestration-core';
 import {
@@ -411,6 +413,42 @@ export class PostgresStore implements EventStore, TransactionalPersistence {
     } finally {
       client.release();
     }
+  }
+
+  public async claimDispatch(input: DispatchClaimRequest): Promise<DispatchClaim | null> {
+    const taskIdValue = canonicalId(input.taskId, 'taskId');
+    const workerId = canonicalId(input.workerId, 'workerId');
+    const agentId = canonicalId(input.agentDefinitionId, 'agentDefinitionId');
+    const leaseId = canonicalId(input.leaseId, 'leaseId');
+    if (input.expiresAt.getTime() <= input.now.getTime()) {
+      throw new InvalidPersistenceOperationError('Dispatch claim expiry must follow now');
+    }
+    const result = await this.pool.query<{
+      task_id: string; worker_id: string; agent_definition_id: string; lease_id: string;
+      expires_at: Date; session_id: string | null;
+    }>(
+      `INSERT INTO task_dispatch_claims (task_id, worker_id, agent_definition_id, lease_id, expires_at)
+       VALUES ($1, $2, $3, $4, $5)
+       ON CONFLICT (task_id) DO UPDATE SET worker_id = EXCLUDED.worker_id, expires_at = EXCLUDED.expires_at
+       WHERE task_dispatch_claims.expires_at <= $6
+         AND task_dispatch_claims.agent_definition_id = EXCLUDED.agent_definition_id
+       RETURNING task_id, worker_id, agent_definition_id, lease_id, expires_at, session_id`,
+      [taskIdValue, workerId, agentId, leaseId, input.expiresAt, input.now]
+    );
+    const row = result.rows[0];
+    return row === undefined ? null : {
+      taskId: row.task_id as DispatchClaim['taskId'], workerId: row.worker_id,
+      agentDefinitionId: row.agent_definition_id as DispatchClaim['agentDefinitionId'],
+      leaseId: row.lease_id, now: input.now, expiresAt: row.expires_at, sessionId: row.session_id
+    };
+  }
+
+  public async releaseDispatch(taskId: Task['id'], workerId: string, leaseId: string): Promise<boolean> {
+    const result = await this.pool.query(
+      'DELETE FROM task_dispatch_claims WHERE task_id = $1 AND worker_id = $2 AND lease_id = $3',
+      [canonicalId(taskId, 'taskId'), canonicalId(workerId, 'workerId'), canonicalId(leaseId, 'leaseId')]
+    );
+    return result.rowCount === 1;
   }
 
   public async close(): Promise<void> {

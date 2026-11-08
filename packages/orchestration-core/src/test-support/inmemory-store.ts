@@ -16,7 +16,7 @@ import {
   InvalidPersistenceOperationError,
   OptimisticConcurrencyError
 } from '../repository';
-import type { EventStore, Outbox, OutboxCommand, TaskRepository } from '../ports';
+import type { DispatchClaim, DispatchClaimRequest, DispatchClaimStore, EventStore, Outbox, OutboxCommand, SaveTaskAndAppendInput, TaskRepository, TransactionalPersistence } from '../ports';
 
 const clone = <T>(value: T): T => globalThis.structuredClone(value);
 
@@ -172,6 +172,52 @@ export class InMemoryEventStore implements EventStore {
 
   public async hasEvent(eventId: EventId): Promise<boolean> {
     return this.eventsById.has(EventIdSchema.parse(eventId));
+  }
+}
+
+export class InMemoryDispatchClaimStore implements DispatchClaimStore {
+  private readonly claims = new Map<string, DispatchClaim>();
+
+  public async claimDispatch(input: DispatchClaimRequest): Promise<DispatchClaim | null> {
+    const workerId = canonicalId(input.workerId, 'workerId');
+    const existing = this.claims.get(input.taskId);
+    if (existing !== undefined && existing.expiresAt > input.now) {
+      return null;
+    }
+    if (existing !== undefined && existing.agentDefinitionId !== input.agentDefinitionId) return null;
+    const claim: DispatchClaim = existing === undefined
+      ? { ...clone(input), workerId, sessionId: null }
+      : { ...clone(existing), workerId, expiresAt: clone(input.expiresAt) };
+    this.claims.set(input.taskId, claim);
+    return clone(claim);
+  }
+
+  public async releaseDispatch(taskId: TaskId, workerId: string, leaseId: string): Promise<boolean> {
+    const claim = this.claims.get(taskId);
+    if (claim === undefined || claim.workerId !== canonicalId(workerId, 'workerId') || claim.leaseId !== leaseId) {
+      return false;
+    }
+    this.claims.delete(taskId);
+    return true;
+  }
+}
+
+export class InMemoryTransactionalPersistence implements TransactionalPersistence {
+  public constructor(
+    private readonly persistence: Pick<TransactionalPersistence, 'saveTaskAndAppend'>,
+    private readonly claims: DispatchClaimStore
+  ) {}
+
+  public saveTaskAndAppend(input: SaveTaskAndAppendInput): Promise<void> {
+    return this.persistence.saveTaskAndAppend(input);
+  }
+
+  public claimDispatch(input: DispatchClaimRequest): Promise<DispatchClaim | null> {
+    return this.claims.claimDispatch(input);
+  }
+
+  public releaseDispatch(taskId: TaskId, workerId: string, leaseId: string): Promise<boolean> {
+    return this.claims.releaseDispatch(taskId, workerId, leaseId);
   }
 }
 
