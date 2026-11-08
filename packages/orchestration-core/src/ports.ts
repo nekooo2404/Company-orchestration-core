@@ -35,8 +35,17 @@ export interface SaveApprovalDecisionAndTaskInput {
   requestFingerprint: string;
 }
 
+export interface SaveApprovalRequestInput {
+  approval: ApprovalRecord;
+  requestEvent: DomainEvent;
+  command: OutboxCommand;
+  idempotencyKey: string;
+  requestFingerprint: string;
+}
+
 export interface TransactionalPersistence {
   saveTaskAndAppend(input: SaveTaskAndAppendInput): Promise<void>;
+  saveApprovalRequest(input: SaveApprovalRequestInput): Promise<ApprovalRecord>;
   saveApprovalDecisionAndTask(input: SaveApprovalDecisionAndTaskInput): Promise<void>;
   claimDispatch(input: DispatchClaimRequest): Promise<DispatchClaim | null>;
   releaseDispatch(taskId: Task['id'], workerId: string, leaseId: string): Promise<boolean>;

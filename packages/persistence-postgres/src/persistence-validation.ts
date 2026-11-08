@@ -108,3 +108,9 @@ export const assertVersion = (version: number, name: string): void => {
     throw new InvalidPersistenceOperationError(`${name} must be a non-negative integer`);
   }
 };
+
+export const assertReadVersion = (version: number, name: string): void => {
+  if (!Number.isInteger(version) || version < -1) {
+    throw new InvalidPersistenceOperationError(`${name} must be an integer greater than or equal to -1`);
+  }
+};

@@ -16,7 +16,7 @@ import {
   InvalidPersistenceOperationError,
   OptimisticConcurrencyError
 } from '../repository';
-import type { DispatchClaim, DispatchClaimRequest, DispatchClaimStore, EventStore, Outbox, OutboxCommand, SaveApprovalDecisionAndTaskInput, SaveTaskAndAppendInput, TaskRepository, TransactionalPersistence } from '../ports';
+import type { DispatchClaim, DispatchClaimRequest, DispatchClaimStore, EventStore, Outbox, OutboxCommand, SaveApprovalDecisionAndTaskInput, SaveApprovalRequestInput, SaveTaskAndAppendInput, TaskRepository, TransactionalPersistence } from '../ports';
 import type { InMemoryApprovalStore } from '../approvals';
 
 const clone = <T>(value: T): T => globalThis.structuredClone(value);
@@ -163,8 +163,37 @@ export class InMemoryEventStore implements EventStore {
     }
   }
 
-  public async readStream(aggregateId: string, afterVersion = 0): Promise<DomainEvent[]> {
-    assertVersion(afterVersion, 'afterVersion');
+  public async appendApprovalRequest(event: DomainEvent): Promise<void> {
+    const parsedEvent = parseDomainEvent(event);
+    if (
+      parsedEvent.aggregateType !== 'APPROVAL' ||
+      parsedEvent.eventType !== 'APPROVAL_REQUESTED' ||
+      parsedEvent.aggregateVersion !== 0
+    ) {
+      throw new InvalidPersistenceOperationError(
+        'Only an APPROVAL_REQUESTED event at aggregate version 0 can initialize an approval stream'
+      );
+    }
+    const existingById = this.eventsById.get(parsedEvent.eventId);
+    if (existingById !== undefined) {
+      if (!sameValue(existingById, parsedEvent)) {
+        throw new DuplicatePersistenceIdError('event', parsedEvent.eventId);
+      }
+      return;
+    }
+    const stream = this.streams.get(parsedEvent.aggregateId) ?? [];
+    if (stream.length > 0) {
+      throw new OptimisticConcurrencyError(parsedEvent.aggregateId, -1, stream.at(-1)?.aggregateVersion ?? 0);
+    }
+    const stored = clone(parsedEvent);
+    this.streams.set(parsedEvent.aggregateId, [stored]);
+    this.eventsById.set(parsedEvent.eventId, stored);
+  }
+
+  public async readStream(aggregateId: string, afterVersion = -1): Promise<DomainEvent[]> {
+    if (!Number.isInteger(afterVersion) || afterVersion < -1) {
+      throw new InvalidPersistenceOperationError('afterVersion must be an integer greater than or equal to -1');
+    }
     const canonicalAggregateId = canonicalId(aggregateId, 'aggregateId');
     return (this.streams.get(canonicalAggregateId) ?? [])
       .filter((event) => event.aggregateVersion > afterVersion)
@@ -239,6 +268,11 @@ export class InMemoryTransactionalPersistence implements TransactionalPersistenc
   public async saveApprovalDecisionAndTask(input: SaveApprovalDecisionAndTaskInput): Promise<void> {
     void input;
     throw new InvalidPersistenceOperationError('Atomic approval persistence is not configured');
+  }
+
+  public async saveApprovalRequest(input: SaveApprovalRequestInput): Promise<import('@aicompany/contracts').ApprovalRecord> {
+    void input;
+    throw new InvalidPersistenceOperationError('Atomic approval request persistence is not configured');
   }
 
   public claimDispatch(input: DispatchClaimRequest): Promise<DispatchClaim | null> {
@@ -391,6 +425,9 @@ export class InMemoryOutbox implements Outbox {
 }
 
 export type InMemoryApprovalFailurePoint =
+  | 'after-request-approval'
+  | 'after-request-event'
+  | 'after-request-outbox'
   | 'after-approval'
   | 'after-task'
   | 'after-approval-event'
@@ -418,6 +455,42 @@ export class InMemoryApprovalTransactionalPersistence implements TransactionalPe
     await this.options.tasks.save(input.task, input.expectedVersion);
     await this.options.events.append(input.events, input.expectedVersion);
     for (const command of input.commands) await this.options.outbox.enqueue(command);
+  }
+
+  public async saveApprovalRequest(input: SaveApprovalRequestInput): Promise<import('@aicompany/contracts').ApprovalRecord> {
+    const prior = await this.options.approvals.findByIdempotencyKey(input.idempotencyKey);
+    if (prior !== null) {
+      if (prior.fingerprint !== input.requestFingerprint) {
+        throw new InvalidPersistenceOperationError('Approval request idempotency key was reused with different data');
+      }
+      return prior.record;
+    }
+    if (input.approval.version !== 0 || input.approval.state !== 'PENDING') {
+      throw new InvalidPersistenceOperationError('Approval requests must start as pending version 0 records');
+    }
+    const approvalSnapshot = this.options.approvals.snapshot();
+    const eventSnapshot = this.options.events.snapshot();
+    const outboxSnapshot = this.options.outbox.snapshot();
+    try {
+      const persisted = await this.options.approvals.commitRequest(
+        input.approval,
+        input.idempotencyKey,
+        input.requestFingerprint,
+        input.requestEvent,
+        input.command
+      );
+      this.failIf('after-request-approval');
+      await this.options.events.appendApprovalRequest(input.requestEvent);
+      this.failIf('after-request-event');
+      await this.options.outbox.enqueue(input.command);
+      this.failIf('after-request-outbox');
+      return persisted;
+    } catch (error) {
+      this.options.approvals.restore(approvalSnapshot);
+      this.options.events.restore(eventSnapshot);
+      this.options.outbox.restore(outboxSnapshot);
+      throw error;
+    }
   }
 
   public async saveApprovalDecisionAndTask(input: SaveApprovalDecisionAndTaskInput): Promise<void> {

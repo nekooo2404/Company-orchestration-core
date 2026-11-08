@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   agentDefinitionId,
   agentSessionId,
+  approvalId,
   correlationId,
   taskId,
   workflowId,
@@ -62,10 +63,41 @@ describe('ApprovalServiceImpl', () => {
     const approved = await instance.decide(approve(requested.approvalId));
     expect(approved).toMatchObject({ state: 'APPROVED', version: 1, decision: 'APPROVE', reason: 'Release staging', decisionReason: 'approved' });
     expect(await tasks.get(task.id)).toMatchObject({ state: 'RUNNING', version: 1 });
+    expect((await events.readStream(requested.approvalId)).map(({ aggregateVersion }) => aggregateVersion)).toEqual([0, 1]);
     expect(await events.readStream(requested.approvalId)).toEqual(expect.arrayContaining([expect.objectContaining({ eventType: 'APPROVAL_APPROVED', payload: expect.objectContaining({ decisionReason: 'approved' }) })]));
     expect(await events.readStream(task.id)).toEqual(expect.arrayContaining([expect.objectContaining({ eventType: 'DEPLOYMENT_APPROVED' })]));
-    expect(await outbox.claim(10, 'deploy-worker')).toEqual([expect.objectContaining({ type: 'DEPLOY', payload: { taskId: task.id, approvalId: requested.approvalId } })]);
+    expect(await outbox.claim(10, 'deploy-worker')).toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: 'REQUEST_APPROVAL' }),
+      expect.objectContaining({ type: 'DEPLOY', payload: { taskId: task.id, approvalId: requested.approvalId } })
+    ]));
     expect(await approvals.get(requested.approvalId)).toEqual(approved);
+  });
+
+  it('rolls back an approval request failure and retries the exact request idempotently', async () => {
+    const first = service();
+    const failingPersistence = {
+      ...first.persistence,
+      saveApprovalRequest: async () => {
+        throw new Error('injected approval request failure');
+      }
+    };
+    const failingInstance = new ApprovalServiceImpl({
+      approvals: first.approvals,
+      taskRepository: first.tasks,
+      transactionalPersistence: failingPersistence,
+      now: () => now
+    });
+    await expect(failingInstance.request(approvalInput)).rejects.toThrow(/injected approval request failure/i);
+    expect(await first.approvals.findByIdempotencyKey(approvalInput.idempotencyKey)).toBeNull();
+    expect(await first.events.readStream(approvalId('approval:DEPLOYMENT:deploy-task:request-1'))).toEqual([]);
+    expect(await first.outbox.claim(10, 'request-rollback-check')).toEqual([]);
+
+    const successful = service();
+    const requested = await successful.instance.request(approvalInput);
+    const retried = await successful.instance.request(approvalInput);
+    expect(retried).toEqual(requested);
+    expect((await successful.events.readStream(requested.approvalId)).map(({ aggregateVersion }) => aggregateVersion)).toEqual([0]);
+    expect(await successful.outbox.claim(10, 'request-retry-check')).toHaveLength(1);
   });
 
   it('requires CEO decisions, checks optimistic versions, and replays the same decision idempotently', async () => {
@@ -75,7 +107,7 @@ describe('ApprovalServiceImpl', () => {
     const approved = await instance.decide(approve(approval.approvalId));
     await expect(instance.decide(approve(approval.approvalId))).resolves.toEqual(approved);
     await expect(instance.decide(approve(approval.approvalId, 'decision-stale'))).rejects.toThrow(/version|pending/i);
-    expect(await outbox.claim(10, 'deploy-worker')).toHaveLength(1);
+    expect(await outbox.claim(10, 'deploy-worker')).toHaveLength(2);
   });
 
   it('returns a deployment task to review while preserving request and decision reasons', async () => {
@@ -94,9 +126,11 @@ describe('ApprovalServiceImpl', () => {
     await expect(instance.decide(approve(requested.approvalId))).rejects.toThrow(/injected atomic approval failure/i);
     expect(await approvals.get(requested.approvalId)).toMatchObject({ state: 'PENDING', version: 0, decisionReason: null });
     expect(await tasks.get(task.id)).toMatchObject({ state: 'WAITING_FOR_APPROVAL', version: 0 });
-    expect(await events.readStream(requested.approvalId)).toEqual([]);
+    expect((await events.readStream(requested.approvalId)).map(({ aggregateVersion }) => aggregateVersion)).toEqual([0]);
     expect(await events.readStream(task.id)).toEqual([]);
-    expect(await outbox.claim(10, 'rollback-check')).toEqual([]);
+    expect(await outbox.claim(10, 'rollback-check')).toEqual([
+      expect.objectContaining({ type: 'REQUEST_APPROVAL' })
+    ]);
   });
 
   it('does not emit duplicate commands for repeated CEO input and rejects changed reuse', async () => {

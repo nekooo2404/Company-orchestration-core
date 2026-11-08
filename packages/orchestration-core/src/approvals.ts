@@ -13,7 +13,7 @@ import {
   type DomainEvent,
   type OutboxCommand
 } from '@aicompany/contracts';
-import type { SaveApprovalDecisionAndTaskInput, TransactionalPersistence } from './ports';
+import type { SaveApprovalDecisionAndTaskInput, SaveApprovalRequestInput, TransactionalPersistence } from './ports';
 import type { TaskRepository } from './repository';
 import { OptimisticConcurrencyError } from './repository';
 import { transitionTask } from './task-state-machine';
@@ -43,7 +43,7 @@ export interface ApprovalService {
 }
 
 export interface ApprovalStore {
-  create(
+  commitRequest(
     record: ApprovalRecord,
     idempotencyKey: string,
     fingerprint: string,
@@ -107,7 +107,7 @@ export class InMemoryApprovalStore implements ApprovalStore {
   public readonly events: DomainEvent[] = [];
   public readonly commands: OutboxCommand[] = [];
 
-  public async create(
+  public async commitRequest(
     record: ApprovalRecord,
     idempotencyKey: string,
     fingerprint: string,
@@ -272,7 +272,7 @@ export class ApprovalServiceImpl implements ApprovalService {
       },
       record.requestedBy,
       now,
-      1,
+      0,
       `approval:${id}:request`
     );
     const command: OutboxCommand = {
@@ -289,7 +289,14 @@ export class ApprovalServiceImpl implements ApprovalService {
       correlationId: record.correlationId,
       causationId: event.eventId
     };
-    return this.options.approvals.create(record, normalized.idempotencyKey, fingerprint, event, command);
+    const requestInput: SaveApprovalRequestInput = {
+      approval: record,
+      requestEvent: event,
+      command,
+      idempotencyKey: normalized.idempotencyKey,
+      requestFingerprint: fingerprint
+    };
+    return this.options.transactionalPersistence.saveApprovalRequest(requestInput);
   }
 
   public async decide(input: ApprovalDecision): Promise<ApprovalRecord> {

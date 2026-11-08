@@ -124,6 +124,8 @@ CREATE TABLE IF NOT EXISTS approvals (
   version integer NOT NULL DEFAULT 0,
   created_at timestamptz NOT NULL,
   updated_at timestamptz NOT NULL,
+  request_idempotency_key text,
+  request_fingerprint text,
   decision_idempotency_key text,
   decision_fingerprint text
 );
@@ -131,9 +133,16 @@ CREATE TABLE IF NOT EXISTS approvals (
 ALTER TABLE approvals
   ADD COLUMN IF NOT EXISTS decision_reason text;
 ALTER TABLE approvals
+  ADD COLUMN IF NOT EXISTS request_idempotency_key text;
+ALTER TABLE approvals
+  ADD COLUMN IF NOT EXISTS request_fingerprint text;
+ALTER TABLE approvals
   ADD COLUMN IF NOT EXISTS decision_idempotency_key text;
 ALTER TABLE approvals
   ADD COLUMN IF NOT EXISTS decision_fingerprint text;
 CREATE UNIQUE INDEX IF NOT EXISTS approvals_decision_idempotency_key
   ON approvals (decision_idempotency_key)
   WHERE decision_idempotency_key IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS approvals_request_idempotency_key
+  ON approvals (request_idempotency_key)
+  WHERE request_idempotency_key IS NOT NULL;

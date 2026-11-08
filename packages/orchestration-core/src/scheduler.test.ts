@@ -24,6 +24,7 @@ import {
   type RecoveryRequest,
   type SaveTaskAndAppendInput,
   type SaveApprovalDecisionAndTaskInput,
+  type SaveApprovalRequestInput,
   type DispatchClaimRequest,
   type TransactionalPersistence
 } from './index';
@@ -142,6 +143,11 @@ class TestTransactionalPersistence implements TransactionalPersistence {
   public async saveApprovalDecisionAndTask(input: SaveApprovalDecisionAndTaskInput): Promise<void> {
     void input;
     throw new Error('atomic approval persistence is not used by scheduler');
+  }
+
+  public async saveApprovalRequest(input: SaveApprovalRequestInput) {
+    void input;
+    throw new Error('atomic approval request persistence is not used by scheduler');
   }
 
   public claimDispatch(input: DispatchClaimRequest) { return this.claims.claimDispatch(input); }

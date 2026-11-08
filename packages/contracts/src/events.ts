@@ -227,7 +227,12 @@ export const DomainEventSchema = z.discriminatedUnion('eventType', [
     eventType: z.literal('DEPLOYMENT_RESULT_RECORDED'),
     payload: DeploymentResultRecordedPayloadSchema
   }),
-  z.object({ ...eventAuditFields, eventType: z.literal('APPROVAL_REQUESTED'), payload: ApprovalRequestedPayloadSchema }),
+  z.object({
+    ...eventAuditFields,
+    aggregateVersion: z.number().int().nonnegative(),
+    eventType: z.literal('APPROVAL_REQUESTED'),
+    payload: ApprovalRequestedPayloadSchema
+  }),
   z.object({ ...eventAuditFields, eventType: z.literal('TASK_ESCALATED'), payload: TaskEscalatedPayloadSchema }),
   z.object({ ...eventAuditFields, eventType: z.literal('TASK_CANCELLED'), payload: TaskCancelledPayloadSchema }),
   z.object({

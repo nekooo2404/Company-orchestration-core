@@ -16,6 +16,7 @@ import {
   OptimisticConcurrencyError,
   type EventStore,
   type SaveTaskAndAppendInput,
+  type SaveApprovalRequestInput,
   type SaveApprovalDecisionAndTaskInput,
   type DispatchClaim,
   type DispatchClaimRequest,
@@ -23,6 +24,7 @@ import {
 } from '@aicompany/orchestration-core';
 import {
   assertVersion,
+  assertReadVersion,
   canonicalId,
   parseDomainEvent,
   parseEventId,
@@ -82,6 +84,26 @@ export interface OutboxCommandRow extends QueryResultRow {
   issued_at: Date;
   correlation_id: string;
   causation_id: string;
+}
+
+interface ApprovalRow extends QueryResultRow {
+  approval_id: string;
+  subject_type: string;
+  subject_id: string;
+  reason: string;
+  requested_by: unknown;
+  correlation_id: string;
+  causation_id: string;
+  state: string;
+  decision: string | null;
+  decision_reason: string | null;
+  decided_by: unknown | null;
+  decided_at: Date | null;
+  version: number;
+  created_at: Date;
+  updated_at: Date;
+  request_idempotency_key: string | null;
+  request_fingerprint: string | null;
 }
 
 const json = (value: unknown): string => JSON.stringify(value) ?? 'null';
@@ -176,6 +198,24 @@ const commandParameters = (command: OutboxCommand): unknown[] => [
   command.causationId
 ];
 
+const approvalFromRow = (row: ApprovalRow): ApprovalRecord => ApprovalRecordSchema.parse({
+  approvalId: row.approval_id,
+  subjectType: row.subject_type,
+  subjectId: row.subject_id,
+  reason: row.reason,
+  requestedBy: row.requested_by,
+  correlationId: row.correlation_id,
+  causationId: row.causation_id,
+  state: row.state,
+  decision: row.decision,
+  decisionReason: row.decision_reason,
+  decidedBy: row.decided_by,
+  decidedAt: row.decided_at,
+  version: row.version,
+  createdAt: row.created_at,
+  updatedAt: row.updated_at
+});
+
 const updateTaskColumns = `
   workflow_id = $2,
   state = $3,
@@ -265,6 +305,14 @@ interface PreparedSaveApprovalDecisionAndTaskInput {
   requestFingerprint: string;
 }
 
+interface PreparedSaveApprovalRequestInput {
+  approval: ApprovalRecord;
+  requestEvent: DomainEvent;
+  command: OutboxCommand;
+  idempotencyKey: string;
+  requestFingerprint: string;
+}
+
 const prepareSaveTaskAndAppend = (
   input: SaveTaskAndAppendInput
 ): PreparedSaveTaskAndAppendInput => {
@@ -344,6 +392,40 @@ const prepareSaveApprovalDecisionAndTask = (
     commands: input.commands.map(parseOutboxCommand),
     idempotencyKey,
     requestFingerprint
+  };
+};
+
+const prepareSaveApprovalRequest = (
+  input: SaveApprovalRequestInput
+): PreparedSaveApprovalRequestInput => {
+  const approval = ApprovalRecordSchema.parse(input.approval);
+  if (approval.version !== 0 || approval.state !== 'PENDING') {
+    throw new InvalidPersistenceOperationError('Approval requests must start as pending version 0 records');
+  }
+  const requestEvent = parseDomainEvent(input.requestEvent);
+  if (
+    requestEvent.aggregateType !== 'APPROVAL' ||
+    requestEvent.aggregateId !== approval.approvalId ||
+    requestEvent.eventType !== 'APPROVAL_REQUESTED' ||
+    requestEvent.aggregateVersion !== 0
+  ) {
+    throw new InvalidPersistenceOperationError('Approval request event must initialize an approval stream at version 0');
+  }
+  const command = parseOutboxCommand(input.command);
+  if (
+    command.type !== 'REQUEST_APPROVAL' ||
+    command.payload.subjectType !== approval.subjectType ||
+    command.payload.subjectId !== approval.subjectId ||
+    command.payload.reason !== approval.reason
+  ) {
+    throw new InvalidPersistenceOperationError('Approval request command does not match the approval record');
+  }
+  return {
+    approval,
+    requestEvent,
+    command,
+    idempotencyKey: canonicalId(input.idempotencyKey, 'idempotencyKey'),
+    requestFingerprint: canonicalId(input.requestFingerprint, 'requestFingerprint')
   };
 };
 
@@ -485,6 +567,105 @@ const saveApprovalDecision = async (
   return false;
 };
 
+const saveApprovalRequestRecord = async (
+  client: PoolClient,
+  input: PreparedSaveApprovalRequestInput
+): Promise<ApprovalRecord> => {
+  const existingResult = await client.query<ApprovalRow>(
+    `SELECT approval_id, subject_type, subject_id, reason, requested_by, correlation_id,
+            causation_id, state, decision, decision_reason, decided_by, decided_at,
+            version, created_at, updated_at, request_idempotency_key, request_fingerprint
+     FROM approvals
+     WHERE approval_id = $1 OR request_idempotency_key = $2
+     ORDER BY CASE WHEN approval_id = $1 THEN 0 ELSE 1 END
+     LIMIT 1
+     FOR UPDATE`,
+    [input.approval.approvalId, input.idempotencyKey]
+  );
+  const existing = existingResult.rows[0];
+  if (existing !== undefined) {
+    if (
+      existing.request_idempotency_key !== input.idempotencyKey ||
+      existing.request_fingerprint !== input.requestFingerprint
+    ) {
+      throw new DuplicatePersistenceIdError('approval request', input.idempotencyKey);
+    }
+    return approvalFromRow(existing);
+  }
+
+  await client.query(
+    `INSERT INTO approvals (
+       approval_id, subject_type, subject_id, reason, requested_by, correlation_id,
+       causation_id, state, decision, decision_reason, decided_by, decided_at,
+       version, created_at, updated_at, request_idempotency_key, request_fingerprint
+     ) VALUES ($1, $2, $3, $4, $5, $6, $7, 'PENDING', NULL, NULL, NULL, NULL, $8, $9, $10, $11, $12)`,
+    [
+      input.approval.approvalId,
+      input.approval.subjectType,
+      input.approval.subjectId,
+      input.approval.reason,
+      json(input.approval.requestedBy),
+      input.approval.correlationId,
+      input.approval.causationId,
+      input.approval.version,
+      input.approval.createdAt,
+      input.approval.updatedAt,
+      input.idempotencyKey,
+      input.requestFingerprint
+    ]
+  );
+  return input.approval;
+};
+
+const appendApprovalRequestWithClient = async (
+  client: PoolClient,
+  event: DomainEvent
+): Promise<void> => {
+  const parsedEvent = parseDomainEvent(event);
+  if (
+    parsedEvent.aggregateType !== 'APPROVAL' ||
+    parsedEvent.eventType !== 'APPROVAL_REQUESTED' ||
+    parsedEvent.aggregateVersion !== 0
+  ) {
+    throw new InvalidPersistenceOperationError(
+      'Only an APPROVAL_REQUESTED event at aggregate version 0 can initialize an approval stream'
+    );
+  }
+
+  const existingResult = await client.query<DomainEventRow>(
+    `SELECT event_id, aggregate_type, aggregate_id, aggregate_version, event_type, payload, actor,
+            correlation_id, causation_id, occurred_at
+     FROM domain_events
+     WHERE event_id = $1`,
+    [parsedEvent.eventId]
+  );
+  const existing = existingResult.rows[0];
+  if (existing !== undefined) {
+    if (!sameValue(toDomainEvent(existing), parsedEvent)) {
+      throw new DuplicatePersistenceIdError('event', parsedEvent.eventId);
+    }
+    return;
+  }
+
+  const streamResult = await client.query<{ version: number }>(
+    `SELECT COALESCE(MAX(aggregate_version), -1)::integer AS version
+     FROM domain_events
+     WHERE aggregate_id = $1`,
+    [parsedEvent.aggregateId]
+  );
+  const actualVersion = streamResult.rows[0].version;
+  if (actualVersion !== -1) {
+    throw new OptimisticConcurrencyError(parsedEvent.aggregateId, -1, actualVersion);
+  }
+  await client.query(
+    `INSERT INTO domain_events (
+       event_id, aggregate_type, aggregate_id, aggregate_version, event_type, payload, actor,
+       correlation_id, causation_id, occurred_at
+     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+    eventParameters(parsedEvent)
+  );
+};
+
 export class PostgresStore implements EventStore, TransactionalPersistence {
   public constructor(private readonly pool: Pool) {}
 
@@ -511,8 +692,24 @@ export class PostgresStore implements EventStore, TransactionalPersistence {
     }
   }
 
-  public async readStream(aggregateId: string, afterVersion = 0): Promise<DomainEvent[]> {
-    assertVersion(afterVersion, 'afterVersion');
+  public async appendApprovalRequest(event: DomainEvent): Promise<void> {
+    const parsedEvent = parseDomainEvent(event);
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      await lockAggregate(client, parsedEvent.aggregateId);
+      await appendApprovalRequestWithClient(client, parsedEvent);
+      await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK').catch(() => undefined);
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  public async readStream(aggregateId: string, afterVersion = -1): Promise<DomainEvent[]> {
+    assertReadVersion(afterVersion, 'afterVersion');
     const canonicalAggregateId = canonicalId(aggregateId, 'aggregateId');
     const result = await this.pool.query<DomainEventRow>(
       `SELECT event_id, aggregate_type, aggregate_id, aggregate_version, event_type, payload, actor,
@@ -547,6 +744,26 @@ export class PostgresStore implements EventStore, TransactionalPersistence {
       await this.appendEvents(client, prepared.events, prepared.expectedVersion);
       await this.enqueueCommands(client, prepared.commands);
       await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK').catch(() => undefined);
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  public async saveApprovalRequest(input: SaveApprovalRequestInput): Promise<ApprovalRecord> {
+    const prepared = prepareSaveApprovalRequest(input);
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      await lockAggregate(client, `approval-request:${prepared.idempotencyKey}`);
+      await lockAggregate(client, prepared.approval.approvalId);
+      const persisted = await saveApprovalRequestRecord(client, prepared);
+      await appendApprovalRequestWithClient(client, prepared.requestEvent);
+      await this.enqueueCommands(client, [prepared.command]);
+      await client.query('COMMIT');
+      return persisted;
     } catch (error) {
       await client.query('ROLLBACK').catch(() => undefined);
       throw error;
