@@ -20,6 +20,7 @@ import {
   type AgentSessionLauncher,
   type Clock,
   type LaunchAgentSessionInput,
+  type RecoveryRecord,
   type RecoveryRequest,
   type SaveTaskAndAppendInput,
   type DispatchClaimRequest,
@@ -145,9 +146,25 @@ class TestTransactionalPersistence implements TransactionalPersistence {
 
 class TestRecoveryCoordinator {
   public readonly requests: RecoveryRequest[] = [];
+  public startFailure: Error | null = null;
 
-  public async request(input: RecoveryRequest): Promise<void> {
+  public async start(input: RecoveryRequest): Promise<RecoveryRecord> {
     this.requests.push(input);
+    if (this.startFailure !== null) throw this.startFailure;
+    return {
+      recoveryId: `test-recovery:${input.taskId}`,
+      taskId: input.taskId,
+      cycle: 1,
+      fingerprint: 'test-fingerprint',
+      plan: {
+        strategyName: 'test-recovery',
+        changedAssumption: 'test assumption',
+        action: 'RETRY'
+      },
+      state: 'STARTED',
+      createdAt: now,
+      evidenceIds: []
+    };
   }
 }
 
@@ -483,10 +500,10 @@ describe('scheduler dispatch', () => {
     expect(launcher.stops).toEqual(['provider-session-different']);
     expect((await harness.repository.get(task.id))?.state).toBe('FAILED');
     expect(recovery.requests).toHaveLength(1);
-    expect(recovery.requests[0].command.type).toBe('START_RECOVERY');
+    expect(recovery.requests[0].failure.commandName).toBe('START_AGENT_SESSION');
   });
 
-  it('retains the claim when mismatch recovery persistence fails', async () => {
+  it('retains the claim when recovery fails after task failure persistence', async () => {
     const task = makeTask('session-mismatch-persistence');
     const repository = new InMemoryTaskRepository();
     await seed(repository, [task]);
@@ -494,27 +511,21 @@ describe('scheduler dispatch', () => {
     const outbox = new InMemoryOutbox({ now: () => clock.current });
     const claims = new InMemoryDispatchClaimStore(repository);
     const base = new TestTransactionalPersistence(repository, outbox, claims);
-    const persistence: TransactionalPersistence = {
-      ...base,
-      saveTaskAndAppend: async (input) => {
-        if (input.commands.some(({ type }) => type === 'START_RECOVERY')) {
-          throw new Error('recovery persistence unavailable');
-        }
-        await base.saveTaskAndAppend(input);
-      },
-      claimDispatch: (input) => base.claimDispatch(input),
-      releaseDispatch: (id, worker, lease) => base.releaseDispatch(id, worker, lease)
-    };
+    const persistence: TransactionalPersistence = base;
     const launcher = new TestLauncher();
     launcher.returnedSessionId = agentSessionId('provider-session-different');
+    const recovery = new TestRecoveryCoordinator();
+    recovery.startFailure = new Error('recovery persistence unavailable');
     const scheduler = new TaskScheduler({
       taskRepository: repository, transactionalPersistence: persistence, outbox, launcher, clock,
-      leaseDurationMs: 1_000, agentDefinitions: [makeAgent('agent-default', 'engineering')]
+      leaseDurationMs: 1_000, agentDefinitions: [makeAgent('agent-default', 'engineering')],
+      recoveryCoordinator: recovery
     });
     await expect(scheduler.tick({
       workflowId: task.workflowId, capacity: 1, workerId: 'worker-a'
     })).rejects.toThrow('recovery persistence unavailable');
     expect(launcher.stops).toEqual(['provider-session-different']);
+    expect((await repository.get(task.id))?.state).toBe('FAILED');
 
     clock.current = new Date(now.getTime() + 1_001);
     const reclaimed = await claims.claimDispatch({
@@ -523,7 +534,7 @@ describe('scheduler dispatch', () => {
       sessionId: agentSessionId(`session:dispatch:${task.id}`),
       leaseId: 'new-lease', now: clock.current, expiresAt: new Date(clock.current.getTime() + 1_000)
     });
-    expect(reclaimed).toMatchObject({ workerId: 'worker-b', sessionId: agentSessionId(`session:dispatch:${task.id}`) });
+    expect(reclaimed).toBeNull();
   });
 
   it('marks a rejected launch failed, requests one recovery and continues unrelated tasks', async () => {
@@ -540,14 +551,13 @@ describe('scheduler dispatch', () => {
     expect(decisions.map(({ taskId: dispatchedTaskId }) => dispatchedTaskId)).toEqual(['task-a', 'task-c']);
     expect(stored.find(({ id }) => id === 'task-b')?.state).toBe('FAILED');
     expect(recovery.requests).toHaveLength(1);
-    expect(recovery.requests[0]).toMatchObject({ taskId: 'task-b', failureFingerprint: expect.any(String) });
-    const failureCall = harness.persistence.calls.find(({ task: savedTask, commands }) =>
-      savedTask.id === 'task-b' && commands.some(({ type }) => type === 'START_RECOVERY')
+    expect(recovery.requests[0]).toMatchObject({ taskId: 'task-b', failure: { errorClass: 'Error' } });
+    const failureCall = harness.persistence.calls.find(({ task: savedTask, events }) =>
+      savedTask.id === 'task-b' && events.some(({ eventType }) => eventType === 'TASK_FAILED')
     );
     expect(failureCall?.events.map(({ eventType, aggregateVersion }) => [eventType, aggregateVersion]))
       .toEqual([['TASK_FAILED', 2]]);
-    expect(failureCall?.commands).toHaveLength(1);
-    expect(failureCall?.commands[0].type).toBe('START_RECOVERY');
+    expect(failureCall?.commands).toHaveLength(0);
     expect(failureCall?.expectedVersion).toBe(1);
   });
 

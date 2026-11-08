@@ -7,6 +7,8 @@ import {
   type Task,
   type TaskId
 } from '@aicompany/contracts';
+import { failureFingerprint } from './failure-fingerprint';
+import type { FailureContext, RecoveryCoordinator } from './recovery';
 import { transitionTask } from './task-state-machine';
 import type { Clock, Lease } from './leases';
 import type { Outbox, TransactionalPersistence } from './ports';
@@ -34,18 +36,7 @@ export interface DispatchDecision {
   correlationId: CorrelationId;
 }
 
-export interface DispatchRecoveryRequest {
-  taskId: TaskId;
-  workflowId: Task['workflowId'];
-  recoveryId: string;
-  failureFingerprint: string;
-  correlationId: CorrelationId;
-  command: OutboxCommand;
-}
-
-export interface DispatchRecoveryCoordinator {
-  request(input: DispatchRecoveryRequest): Promise<void>;
-}
+export type DispatchRecoveryCoordinator = Pick<RecoveryCoordinator, 'start'>;
 
 export interface DispatchOptions {
   transactionalPersistence: TransactionalPersistence;
@@ -69,10 +60,27 @@ export interface DispatchResult {
 
 const systemActor = { kind: 'SYSTEM' as const, name: 'scheduler' };
 
-const failureFingerprint = (error: unknown): string => {
-  const name = error instanceof Error ? error.name : 'UnknownError';
-  const message = error instanceof Error ? error.message : String(error);
-  return `${name}:${message.replace(/\s+/g, ' ').trim().slice(0, 200)}`;
+const errorExitCode = (error: unknown): number | undefined => {
+  if (error === null || typeof error !== 'object') return undefined;
+  const exitCode = (error as { exitCode?: unknown }).exitCode;
+  return typeof exitCode === 'number' && Number.isFinite(exitCode) ? exitCode : undefined;
+};
+
+const failureContext = (
+  task: Task,
+  attemptId: AgentSessionId,
+  error: unknown
+): FailureContext => {
+  const exitCode = errorExitCode(error);
+  return {
+    taskId: task.id,
+    attemptId,
+    errorClass: error instanceof Error ? error.name : 'UnknownError',
+    commandName: 'START_AGENT_SESSION',
+    ...(exitCode === undefined ? {} : { exitCode }),
+    message: error instanceof Error ? error.message : String(error),
+    evidenceIds: []
+  };
 };
 
 const startCommand = (
@@ -99,22 +107,6 @@ const startCommand = (
   causationId: eventId
 });
 
-const recoveryCommand = (
-  task: Task,
-  recoveryId: string,
-  eventId: OutboxCommand['causationId'],
-  issuedAt: Date
-): OutboxCommand => ({
-  commandId: `start-recovery:${task.id}:${recoveryId}`,
-  type: 'START_RECOVERY',
-  payload: { taskId: task.id, recoveryId },
-  actor: systemActor,
-  issuedAt,
-  availableAt: issuedAt,
-  correlationId: task.traceId,
-  causationId: eventId
-});
-
 export class TaskDispatcher {
   public constructor(private readonly options: DispatchOptions) {}
 
@@ -134,7 +126,7 @@ export class TaskDispatcher {
     try {
       session = await this.options.launcher.launch(launchInput);
     } catch (error) {
-      await this.persistFailure(task, lease, failureFingerprint(error));
+      await this.persistFailure(task, sessionId, error);
       return { decision: null, releaseClaim: true };
     }
 
@@ -147,7 +139,7 @@ export class TaskDispatcher {
       } catch (error) {
         throw new Error('Launcher session identity mismatch and cleanup failed', { cause: error });
       }
-      await this.persistFailure(task, lease, failureFingerprint(mismatch));
+      await this.persistFailure(task, sessionId, mismatch);
       return { decision: null, releaseClaim: true };
     }
 
@@ -198,9 +190,11 @@ export class TaskDispatcher {
 
   private async persistFailure(
     task: Task,
-    lease: Lease,
-    fingerprint: string
+    attemptId: AgentSessionId,
+    error: unknown
   ): Promise<void> {
+    const failure = failureContext(task, attemptId, error);
+    const fingerprint = failureFingerprint(failure);
     const context = {
       actor: systemActor,
       now: this.options.clock.now(),
@@ -212,21 +206,17 @@ export class TaskDispatcher {
       { type: 'TASK_FAILED', failureFingerprint: fingerprint },
       context
     );
-    const recoveryId = `recovery:${task.id}:cycle:${task.recoveryCycles + 1}`;
-    const command = recoveryCommand(task, recoveryId, failed.event.eventId, context.now);
     await this.options.transactionalPersistence.saveTaskAndAppend({
       task: failed.task,
       expectedVersion: task.version,
       events: [failed.event],
-      commands: [command]
+      commands: []
     });
-    await this.options.recoveryCoordinator?.request({
+    await this.options.recoveryCoordinator?.start({
       taskId: task.id,
-      workflowId: task.workflowId,
-      recoveryId,
-      failureFingerprint: fingerprint,
+      failure,
+      actor: systemActor,
       correlationId: task.traceId,
-      command
     });
   }
 }
