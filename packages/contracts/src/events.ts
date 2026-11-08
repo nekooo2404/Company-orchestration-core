@@ -255,7 +255,9 @@ export const StartAgentSessionPayloadSchema = z.object({
   workflowId: WorkflowIdSchema,
   agentDefinitionId: AgentDefinitionIdSchema,
   leaseId: nonEmptyText,
-  idempotencyKey: AgentSessionIdSchema
+  idempotencyKey: AgentSessionIdSchema,
+  attempt: z.number().int().positive().optional(),
+  completedOperationKeys: z.array(nonEmptyText).optional()
 });
 export const StartRecoveryPayloadSchema = z.object({
   taskId: TaskIdSchema,

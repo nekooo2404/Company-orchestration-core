@@ -199,6 +199,11 @@ export class InMemoryDispatchClaimStore implements DispatchClaimStore {
     return clone(claim);
   }
 
+  public async getDispatchClaim(taskId: TaskId): Promise<DispatchClaim | null> {
+    const claim = this.claims.get(TaskIdSchema.parse(taskId));
+    return claim === undefined ? null : clone(claim);
+  }
+
   public async releaseDispatch(taskId: TaskId, workerId: string, leaseId: string): Promise<boolean> {
     const claim = this.claims.get(taskId);
     if (claim === undefined || claim.workerId !== canonicalId(workerId, 'workerId') || claim.leaseId !== leaseId) {

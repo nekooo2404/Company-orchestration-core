@@ -44,6 +44,7 @@ export type DispatchClaim = DispatchClaimRequest;
 
 export interface DispatchClaimStore {
   claimDispatch(input: DispatchClaimRequest): Promise<DispatchClaim | null>;
+  getDispatchClaim(taskId: Task['id']): Promise<DispatchClaim | null>;
   releaseDispatch(taskId: Task['id'], workerId: string, leaseId: string): Promise<boolean>;
 }
 
