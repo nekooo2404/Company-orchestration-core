@@ -45,6 +45,8 @@ corepack pnpm --filter @aicompany/persistence-postgres exec node -e "const { rea
 corepack pnpm --filter @aicompany/persistence-postgres exec vitest run --config vitest.config.ts src/postgres-store.integration.test.ts
 ```
 
+The `Copy-Item` step creates the ignored local environment file from the checked-in example; never commit `infra/postgres/.env` or replace its local-only password in a shared environment.
+
 The integration suite is gated on `DATABASE_URL` or `POSTGRES_TESTCONTAINERS`; absent either setting, it is skipped. Record that outcome as **GATED/SKIPPED**, not passed. The schema and adapter tests cover SQL behavior, but only the enabled integration suite proves runtime interaction with PostgreSQL. Stop local PostgreSQL with `docker compose --env-file infra/postgres/.env -f infra/postgres/compose.yaml down` when finished.
 
 ## Track 1 completion evidence
