@@ -14,4 +14,7 @@ export * from './fair-queue';
 export * from './leases';
 export * from './dispatch';
 export * from './scheduler';
+export * from './channel-policy';
+export * from './communication';
+export * from './decision-records';
 export * from './test-support/inmemory-store';
