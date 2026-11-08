@@ -2,7 +2,8 @@ import type {
   DomainEvent,
   EventId,
   OutboxCommand as ContractOutboxCommand,
-  Task
+  Task,
+  AgentSessionId
 } from '@aicompany/contracts';
 export type { TaskRepository } from './repository';
 
@@ -29,16 +30,17 @@ export interface TransactionalPersistence {
 
 export interface DispatchClaimRequest {
   taskId: Task['id'];
+  taskVersion: number;
+  taskState: Task['state'];
   workerId: string;
   agentDefinitionId: NonNullable<Task['ownerAgentDefinitionId']>;
+  sessionId: AgentSessionId;
   leaseId: string;
   now: Date;
   expiresAt: Date;
 }
 
-export interface DispatchClaim extends DispatchClaimRequest {
-  sessionId: string | null;
-}
+export type DispatchClaim = DispatchClaimRequest;
 
 export interface DispatchClaimStore {
   claimDispatch(input: DispatchClaimRequest): Promise<DispatchClaim | null>;

@@ -75,8 +75,8 @@ const makeAgent = (
   ...overrides
 });
 
-const makeSession = (input: LaunchAgentSessionInput): AgentSession => ({
-  sessionId: agentSessionId(`session-${input.taskId}`),
+const makeSession = (input: LaunchAgentSessionInput, sessionIdentifier = input.sessionId): AgentSession => ({
+  sessionId: sessionIdentifier,
   taskId: input.taskId,
   workflowId: input.workflowId,
   agentDefinitionId: input.agentDefinitionId,
@@ -105,13 +105,14 @@ class TestLauncher implements AgentSessionLauncher {
   public readonly failures = new Set<string>();
   public stopFailure = false;
   public readonly stops: string[] = [];
+  public returnedSessionId: AgentSession['sessionId'] | null = null;
 
   public async launch(input: LaunchAgentSessionInput): Promise<AgentSession> {
     this.calls.push(input);
     if (this.failures.has(input.taskId)) {
       throw new Error(`provider rejected ${input.taskId}`);
     }
-    return makeSession(input);
+    return makeSession(input, this.returnedSessionId ?? input.sessionId);
   }
 
   public async stop(sessionId: string): Promise<void> {
@@ -125,7 +126,7 @@ class TestTransactionalPersistence implements TransactionalPersistence {
   public constructor(
     private readonly repository: InMemoryTaskRepository,
     private readonly outbox: InMemoryOutbox,
-    private readonly claims = new InMemoryDispatchClaimStore()
+    private readonly claims = new InMemoryDispatchClaimStore(repository)
   ) {}
 
   public async saveTaskAndAppend(input: SaveTaskAndAppendInput): Promise<void> {
@@ -186,6 +187,14 @@ const seed = async (repository: InMemoryTaskRepository, tasks: readonly Task[]):
   }
 };
 
+const seedReady = async (repository: InMemoryTaskRepository, task: Task): Promise<Task> => {
+  const pending = { ...task, state: 'PENDING' as const, version: 0 };
+  await repository.save(pending, 0);
+  const ready = { ...pending, state: 'READY' as const, version: 1 };
+  await repository.save(ready, 0);
+  return ready;
+};
+
 describe('scheduler dispatch', () => {
   it('dispatches exactly 50 of 60 ready tasks and later dispatches the ten remaining tasks', async () => {
     const tasks = Array.from({ length: 60 }, (_, index) => makeTask(`task-${index.toString().padStart(2, '0')}`));
@@ -235,7 +244,8 @@ describe('scheduler dispatch', () => {
 
   it('keeps task state and the start command in one transactional persistence call', async () => {
     const task = makeTask('task-1');
-    const harness = makeScheduler({ tasks: [task] });
+    const launcher = new TestLauncher();
+    const harness = makeScheduler({ tasks: [task], launcher });
     await seed(harness.repository, [task]);
 
     const [decision] = await harness.scheduler.tick({ workflowId: workflowId('workflow-1'), capacity: 1, workerId: 'worker-a' });
@@ -257,6 +267,7 @@ describe('scheduler dispatch', () => {
       type: 'START_AGENT_SESSION',
       payload: { taskId: task.id, leaseId: decision.leaseId }
     });
+    expect(launcher.calls[0].sessionId).toBe(agentSessionId(`session:dispatch:${task.id}`));
   });
 
   it('does not launch a second session for a repeated tick after a successful dispatch', async () => {
@@ -290,9 +301,9 @@ describe('scheduler dispatch', () => {
     const clock = new TestClock();
     const task = makeTask('task-shared');
     const repository = new InMemoryTaskRepository();
-    await seed(repository, [task]);
+    await seedReady(repository, task);
     const outbox = new InMemoryOutbox({ now: () => clock.current });
-    const claimStore = new InMemoryDispatchClaimStore();
+    const claimStore = new InMemoryDispatchClaimStore(repository);
     const persistA = new TestTransactionalPersistence(repository, outbox, claimStore);
     const persistB = new TestTransactionalPersistence(repository, outbox, claimStore);
     const launcher = new TestLauncher();
@@ -308,11 +319,32 @@ describe('scheduler dispatch', () => {
     ]);
     expect(first.length + second.length).toBe(1);
     expect(launcher.calls).toHaveLength(1);
-    expect(await claimStore.claimDispatch({
-      taskId: task.id, workerId: 'worker-b', agentDefinitionId: agentDefinitionId('agent-default'),
-      leaseId: 'irrelevant-new-id', now: new Date(now.getTime() + 5 * 60_001),
-      expiresAt: new Date(now.getTime() + 10 * 60_000)
-    })).toMatchObject({ leaseId: (first[0] ?? second[0]).leaseId, workerId: 'worker-b' });
+    expect((await repository.get(task.id))?.state).toBe('RUNNING');
+  });
+
+  it('persists the planned session identity and reuses it on READY claim reclaim', async () => {
+    const task = makeTask('claim-reclaim');
+    const repository = new InMemoryTaskRepository();
+    const readyTask = await seedReady(repository, task);
+    const claims = new InMemoryDispatchClaimStore(repository);
+    const sessionId = agentSessionId(`session:dispatch:${task.id}`);
+    const first = await claims.claimDispatch({
+      taskId: readyTask.id, taskVersion: readyTask.version, taskState: readyTask.state,
+      workerId: 'worker-a', agentDefinitionId: agentDefinitionId('agent-default'), sessionId,
+      leaseId: 'lease-proposed', now, expiresAt: new Date(now.getTime() + 1000)
+    });
+    expect(first).toMatchObject({ leaseId: 'lease-proposed', sessionId, workerId: 'worker-a' });
+    expect(await claims.claimDispatch({
+      taskId: readyTask.id, taskVersion: readyTask.version, taskState: readyTask.state,
+      workerId: 'worker-b', agentDefinitionId: agentDefinitionId('agent-default'), sessionId,
+      leaseId: 'different-lease', now, expiresAt: new Date(now.getTime() + 1000)
+    })).toBeNull();
+    expect(await claims.claimDispatch({
+      taskId: readyTask.id, taskVersion: readyTask.version, taskState: readyTask.state,
+      workerId: 'worker-b', agentDefinitionId: agentDefinitionId('agent-default'), sessionId,
+      leaseId: 'different-lease', now: new Date(now.getTime() + 1001),
+      expiresAt: new Date(now.getTime() + 2001)
+    })).toMatchObject({ leaseId: 'lease-proposed', sessionId, workerId: 'worker-b' });
   });
 
   it('does not dispatch without configured agent definitions', async () => {
@@ -328,7 +360,7 @@ describe('scheduler dispatch', () => {
     const repository = new InMemoryTaskRepository();
     await seed(repository, [task]);
     const outbox = new InMemoryOutbox({ now: () => now });
-    const claims = new InMemoryDispatchClaimStore();
+    const claims = new InMemoryDispatchClaimStore(repository);
     const base = new TestTransactionalPersistence(repository, outbox, claims);
     const persistence: TransactionalPersistence = {
       ...base,
@@ -347,7 +379,8 @@ describe('scheduler dispatch', () => {
     });
     await expect(scheduler.tick({ workflowId: task.workflowId, capacity: 1, workerId: 'worker-a' })).rejects.toThrow(/cleanup/);
     const claim = await claims.claimDispatch({
-      taskId: task.id, workerId: 'worker-b', agentDefinitionId: agentDefinitionId('agent-default'),
+      taskId: task.id, taskVersion: 1, taskState: 'READY', workerId: 'worker-b',
+      agentDefinitionId: agentDefinitionId('agent-default'), sessionId: agentSessionId(`session:dispatch:${task.id}`),
       leaseId: 'new-id', now: now, expiresAt: new Date(now.getTime() + 1000)
     });
     expect(claim).toBeNull();
@@ -355,14 +388,44 @@ describe('scheduler dispatch', () => {
   });
 
   it('checks worker ownership when releasing a claim', async () => {
-    const claims = new InMemoryDispatchClaimStore();
+    const repository = new InMemoryTaskRepository();
+    const task = makeTask('owned');
+    const readyTask = await seedReady(repository, task);
+    const claims = new InMemoryDispatchClaimStore(repository);
     const input: DispatchClaimRequest = {
-      taskId: taskId('owned'), workerId: 'worker-a', agentDefinitionId: agentDefinitionId('agent-default'),
+      taskId: readyTask.id, taskVersion: readyTask.version, taskState: readyTask.state, workerId: 'worker-a',
+      agentDefinitionId: agentDefinitionId('agent-default'), sessionId: agentSessionId('session-owned'),
       leaseId: 'lease-owned', now, expiresAt: new Date(now.getTime() + 1000)
     };
     expect(await claims.claimDispatch(input)).not.toBeNull();
     expect(await claims.releaseDispatch(input.taskId, 'worker-b', input.leaseId)).toBe(false);
     expect(await claims.releaseDispatch(input.taskId, input.workerId, input.leaseId)).toBe(true);
+  });
+
+  it('rejects a stale version and a RUNNING task at the shared claim boundary', async () => {
+    const task = makeTask('claim-state');
+    const repository = new InMemoryTaskRepository();
+    const readyTask = await seedReady(repository, task);
+    const claims = new InMemoryDispatchClaimStore(repository);
+    const request: DispatchClaimRequest = {
+      taskId: readyTask.id, taskVersion: readyTask.version, taskState: readyTask.state, workerId: 'worker-a',
+      agentDefinitionId: agentDefinitionId('agent-default'), sessionId: agentSessionId('session-state'),
+      leaseId: 'lease-state', now, expiresAt: new Date(now.getTime() + 1000)
+    };
+    expect(await claims.claimDispatch({ ...request, taskVersion: 0 })).toBeNull();
+    expect(await claims.claimDispatch(request)).not.toBeNull();
+    await repository.save({ ...readyTask, state: 'RUNNING', version: 2 }, readyTask.version);
+    expect(await claims.claimDispatch(request)).toBeNull();
+  });
+
+  it('stops the actual provider session when launch returns a different identity', async () => {
+    const task = makeTask('session-mismatch');
+    const launcher = new TestLauncher();
+    launcher.returnedSessionId = agentSessionId('provider-session-different');
+    const harness = makeScheduler({ tasks: [task], launcher });
+    await seed(harness.repository, [task]);
+    expect(await harness.scheduler.tick({ workflowId: task.workflowId, capacity: 1, workerId: 'worker-a' })).toEqual([]);
+    expect(launcher.stops).toEqual(['provider-session-different']);
   });
 
   it('marks a rejected launch failed, requests one recovery and continues unrelated tasks', async () => {

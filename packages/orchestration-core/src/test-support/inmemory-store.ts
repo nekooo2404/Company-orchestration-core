@@ -178,16 +178,23 @@ export class InMemoryEventStore implements EventStore {
 export class InMemoryDispatchClaimStore implements DispatchClaimStore {
   private readonly claims = new Map<string, DispatchClaim>();
 
+  public constructor(private readonly tasks?: TaskRepository) {}
+
   public async claimDispatch(input: DispatchClaimRequest): Promise<DispatchClaim | null> {
     const workerId = canonicalId(input.workerId, 'workerId');
+    const task = await this.tasks?.get(input.taskId);
+    if (this.tasks !== undefined && (task === null || task?.state !== 'READY' || task.version !== input.taskVersion || input.taskState !== 'READY')) return null;
     const existing = this.claims.get(input.taskId);
     if (existing !== undefined && existing.expiresAt > input.now) {
       return null;
     }
-    if (existing !== undefined && existing.agentDefinitionId !== input.agentDefinitionId) return null;
+    if (
+      existing !== undefined &&
+      (existing.agentDefinitionId !== input.agentDefinitionId || existing.sessionId !== input.sessionId)
+    ) return null;
     const claim: DispatchClaim = existing === undefined
-      ? { ...clone(input), workerId, sessionId: null }
-      : { ...clone(existing), workerId, expiresAt: clone(input.expiresAt) };
+      ? { ...clone(input), workerId }
+      : { ...clone(existing), workerId, expiresAt: clone(input.expiresAt), taskVersion: input.taskVersion, taskState: input.taskState };
     this.claims.set(input.taskId, claim);
     return clone(claim);
   }

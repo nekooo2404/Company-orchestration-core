@@ -2,6 +2,7 @@ import { Pool, type PoolClient, type QueryResultRow } from 'pg';
 import {
   DomainEventSchema,
   TaskSchema,
+  agentSessionId,
   type DomainEvent,
   type EventId,
   type OutboxCommand,
@@ -420,27 +421,51 @@ export class PostgresStore implements EventStore, TransactionalPersistence {
     const workerId = canonicalId(input.workerId, 'workerId');
     const agentId = canonicalId(input.agentDefinitionId, 'agentDefinitionId');
     const leaseId = canonicalId(input.leaseId, 'leaseId');
+    const sessionId = canonicalId(input.sessionId, 'sessionId');
+    if (!Number.isInteger(input.taskVersion) || input.taskVersion < 0 || input.taskState !== 'READY') return null;
     if (input.expiresAt.getTime() <= input.now.getTime()) {
       throw new InvalidPersistenceOperationError('Dispatch claim expiry must follow now');
     }
-    const result = await this.pool.query<{
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      const taskResult = await client.query<{ version: number; state: string }>(
+        'SELECT version, state FROM tasks WHERE task_id = $1 FOR UPDATE', [taskIdValue]
+      );
+      const task = taskResult.rows[0];
+      if (task === undefined || task.version !== input.taskVersion || task.state !== 'READY') {
+        await client.query('ROLLBACK');
+        return null;
+      }
+      const result = await client.query<{
       task_id: string; worker_id: string; agent_definition_id: string; lease_id: string;
-      expires_at: Date; session_id: string | null;
+      expires_at: Date; session_id: string; task_version: number; task_state: string;
     }>(
-      `INSERT INTO task_dispatch_claims (task_id, worker_id, agent_definition_id, lease_id, expires_at)
-       VALUES ($1, $2, $3, $4, $5)
-       ON CONFLICT (task_id) DO UPDATE SET worker_id = EXCLUDED.worker_id, expires_at = EXCLUDED.expires_at
-       WHERE task_dispatch_claims.expires_at <= $6
+      `INSERT INTO task_dispatch_claims (task_id, worker_id, agent_definition_id, task_version, task_state, lease_id, session_id, expires_at)
+       VALUES ($1, $2, $3, $4, 'READY', $5, $6, $7)
+       ON CONFLICT (task_id) DO UPDATE SET worker_id = EXCLUDED.worker_id, expires_at = EXCLUDED.expires_at,
+         task_version = EXCLUDED.task_version, task_state = EXCLUDED.task_state
+       WHERE task_dispatch_claims.expires_at <= $8
          AND task_dispatch_claims.agent_definition_id = EXCLUDED.agent_definition_id
-       RETURNING task_id, worker_id, agent_definition_id, lease_id, expires_at, session_id`,
-      [taskIdValue, workerId, agentId, leaseId, input.expiresAt, input.now]
+         AND task_dispatch_claims.task_version = EXCLUDED.task_version
+         AND task_dispatch_claims.session_id = EXCLUDED.session_id
+       RETURNING task_id, worker_id, agent_definition_id, lease_id, expires_at, session_id, task_version, task_state`,
+      [taskIdValue, workerId, agentId, input.taskVersion, leaseId, sessionId, input.expiresAt, input.now]
     );
-    const row = result.rows[0];
-    return row === undefined ? null : {
-      taskId: row.task_id as DispatchClaim['taskId'], workerId: row.worker_id,
-      agentDefinitionId: row.agent_definition_id as DispatchClaim['agentDefinitionId'],
-      leaseId: row.lease_id, now: input.now, expiresAt: row.expires_at, sessionId: row.session_id
-    };
+      await client.query('COMMIT');
+      const row = result.rows[0];
+      return row === undefined ? null : {
+        taskId: row.task_id as DispatchClaim['taskId'], workerId: row.worker_id,
+        agentDefinitionId: row.agent_definition_id as DispatchClaim['agentDefinitionId'],
+        taskVersion: row.task_version, taskState: row.task_state as DispatchClaim['taskState'],
+        leaseId: row.lease_id, sessionId: agentSessionId(row.session_id), now: input.now, expiresAt: row.expires_at
+      };
+    } catch (error) {
+      await client.query('ROLLBACK').catch(() => undefined);
+      throw error;
+    } finally {
+      client.release();
+    }
   }
 
   public async releaseDispatch(taskId: Task['id'], workerId: string, leaseId: string): Promise<boolean> {

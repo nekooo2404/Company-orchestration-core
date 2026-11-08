@@ -1,7 +1,8 @@
 import {
   type AgentDefinition,
   type AgentDefinitionId,
-  type Task
+  type Task,
+  agentSessionId
 } from '@aicompany/contracts';
 import { findReadyTasks } from './task-graph';
 import { transitionTask } from './task-state-machine';
@@ -222,19 +223,6 @@ export class SchedulerService implements Scheduler {
     workerId: string
   ): Promise<DispatchDecision | null> {
     const agentDefinitionIdValue = agent.id;
-    const now = this.options.clock.now();
-    const durationMs = this.options.leaseDurationMs ?? 5 * 60 * 1000;
-    const claim = await this.options.transactionalPersistence.claimDispatch({
-      taskId: task.id,
-      workerId,
-      agentDefinitionId: agentDefinitionIdValue,
-      leaseId: `dispatch:${task.id}`,
-      now,
-      expiresAt: new Date(now.getTime() + durationMs)
-    });
-    if (claim === null) return null;
-    const lease: Lease = { taskId: task.id, leaseId: claim.leaseId, expiresAt: claim.expiresAt };
-
     const assignedTask = task.ownerAgentDefinitionId === null
         ? { ...task, ownerAgentDefinitionId: agentDefinitionIdValue }
         : task;
@@ -254,10 +242,26 @@ export class SchedulerService implements Scheduler {
         });
         readyTask = ready.task;
       }
+    const now = this.options.clock.now();
+    const durationMs = this.options.leaseDurationMs ?? 5 * 60 * 1000;
+    const claim = await this.options.transactionalPersistence.claimDispatch({
+      taskId: readyTask.id,
+      taskVersion: readyTask.version,
+      taskState: readyTask.state,
+      workerId,
+      agentDefinitionId: agentDefinitionIdValue,
+      sessionId: agentSessionId(`session:dispatch:${readyTask.id}`),
+      leaseId: `dispatch:${readyTask.id}`,
+      now,
+      expiresAt: new Date(now.getTime() + durationMs)
+    });
+    if (claim === null) return null;
+    const lease: Lease = { taskId: task.id, leaseId: claim.leaseId, expiresAt: claim.expiresAt };
       const result = await this.dispatcher.dispatch({
         task: readyTask,
         agentDefinitionId: agentDefinitionIdValue,
-        lease
+        lease,
+        sessionId: claim.sessionId
       });
       if (result.releaseClaim) {
         await this.options.transactionalPersistence.releaseDispatch(task.id, workerId, lease.leaseId);

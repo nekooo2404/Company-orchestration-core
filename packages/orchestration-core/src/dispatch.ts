@@ -3,7 +3,6 @@ import {
   type AgentSession,
   type AgentSessionId,
   type CorrelationId,
-  agentSessionId,
   type OutboxCommand,
   type Task,
   type TaskId
@@ -59,6 +58,7 @@ export interface DispatchTaskInput {
   task: Task;
   agentDefinitionId: AgentDefinitionId;
   lease: Lease;
+  sessionId: AgentSessionId;
 }
 
 export interface DispatchResult {
@@ -116,13 +116,13 @@ export class TaskDispatcher {
   public constructor(private readonly options: DispatchOptions) {}
 
   public async dispatch(input: DispatchTaskInput): Promise<DispatchResult> {
-    const { task, agentDefinitionId, lease } = input;
+    const { task, agentDefinitionId, lease, sessionId } = input;
     const launchInput: LaunchAgentSessionInput = {
       taskId: task.id,
       workflowId: task.workflowId,
       agentDefinitionId,
       leaseId: lease.leaseId,
-      sessionId: agentSessionId(`session:${lease.leaseId}`),
+      sessionId,
       correlationId: task.traceId
     };
 
@@ -132,6 +132,15 @@ export class TaskDispatcher {
     } catch (error) {
       await this.persistFailure(task, lease, failureFingerprint(error));
       return { decision: null, releaseClaim: true };
+    }
+
+    if (session.sessionId !== sessionId) {
+      try {
+        await this.options.launcher.stop(session.sessionId, 'launcher returned a different session identity');
+        return { decision: null, releaseClaim: true };
+      } catch (error) {
+        throw new Error('Launcher session identity mismatch and cleanup failed', { cause: error });
+      }
     }
 
     const context = {
@@ -162,7 +171,7 @@ export class TaskDispatcher {
       });
     } catch (error) {
       try {
-        await this.options.launcher.stop(launchInput.sessionId, 'dispatch persistence failed');
+        await this.options.launcher.stop(session.sessionId, 'dispatch persistence failed');
         return { decision: null, releaseClaim: true };
       } catch (stopError) {
         throw new AggregateError([error, stopError], 'Dispatch persistence and provider cleanup both failed');
