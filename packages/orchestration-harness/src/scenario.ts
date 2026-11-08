@@ -25,6 +25,7 @@ import {
   createDefaultRecoveryStrategies,
   transitionTask
 } from '@aicompany/orchestration-core';
+import type { RecoveryPlan } from '@aicompany/orchestration-core';
 import { SimulatedAgent } from './simulated-agent';
 import type { SimulatedAgentResult } from './simulated-agent';
 
@@ -67,8 +68,12 @@ export interface RecoveryScenarioResult {
     taskId: TaskId;
     cycle: number;
     fingerprint: string;
+    failureAssumption: string;
     selectedStrategyName: string;
     usedStrategyName: string;
+    action: RecoveryPlan['action'];
+    succeeded: boolean;
+    environment: { activeAgent: string; dependencyAvailable: boolean; workspace: string; planRevision: number };
     state: string;
   }>;
   successfulStrategyName: string;
@@ -135,10 +140,46 @@ const saveTransition = async (harness: Harness, task: Task, type: 'TASK_COMPLETE
   return result.task;
 };
 
-const executeRecoveryPlan = (plan: { strategyName: string }, outcome: 'FAIL' | 'SUCCEED') => ({
-  appliedStrategyName: plan.strategyName,
-  outcome
-});
+interface RecoverySimulationEnvironment {
+  failingAgent: 'primary';
+  activeAgent: 'primary' | 'alternate';
+  dependencyAvailable: boolean;
+  workspace: 'dirty' | 'clean';
+  planRevision: number;
+  canSucceed: boolean;
+}
+
+const executeRecoveryPlan = (plan: RecoveryPlan, environment: RecoverySimulationEnvironment) => {
+  switch (plan.action) {
+    case 'RETRY':
+      break;
+    case 'ALTERNATE_AGENT':
+      environment.activeAgent = 'alternate';
+      break;
+    case 'DEPENDENCY_REPAIR':
+      environment.dependencyAvailable = true;
+      break;
+    case 'ROLLBACK':
+      environment.workspace = 'clean';
+      break;
+    case 'REPLAN':
+      environment.planRevision += 1;
+      break;
+  }
+  const resolved = environment.activeAgent !== environment.failingAgent ||
+    environment.dependencyAvailable || environment.workspace === 'clean' || environment.planRevision > 0;
+  return {
+    appliedStrategyName: plan.strategyName,
+    appliedAction: plan.action,
+    succeeded: environment.canSucceed && resolved,
+    environment: {
+      activeAgent: environment.activeAgent,
+      dependencyAvailable: environment.dependencyAvailable,
+      workspace: environment.workspace,
+      planRevision: environment.planRevision
+    }
+  };
+};
 
 const createScheduler = (harness: Harness, agent: SimulatedAgent): SchedulerService => {
   const definitions = departments.map((department) => ({
@@ -283,7 +324,11 @@ export async function runRecoveryScenario(): Promise<RecoveryScenarioResult> {
   const dependent = { ...makeTask(taskId('recovery-dependent'), workflow, 4), dependencyIds: [escalated.id] };
   for (const task of [retry, escalated, independent, dependent]) await harness.tasks.save(task, 0);
   const recoveryAttempts: RecoveryScenarioResult['recoveryAttempts'] = [];
-  const recoveryFor = async (task: Task, cycle: number, succeeds: boolean) => {
+  const recoveryEnvironments = new Map<TaskId, RecoverySimulationEnvironment>([
+    [retry.id, { failingAgent: 'primary', activeAgent: 'primary', dependencyAvailable: false, workspace: 'dirty', planRevision: 0, canSucceed: true }],
+    [escalated.id, { failingAgent: 'primary', activeAgent: 'primary', dependencyAvailable: false, workspace: 'dirty', planRevision: 0, canSucceed: false }]
+  ]);
+  const recoveryFor = async (task: Task, cycle: number) => {
     let current = (await harness.tasks.get(task.id))!;
     if (current.state !== 'FAILED') {
       if (current.state === 'PENDING') {
@@ -301,24 +346,29 @@ export async function runRecoveryScenario(): Promise<RecoveryScenarioResult> {
     }
     const record = await harness.recovery.start({ taskId: task.id, failure: { taskId: task.id, attemptId: `attempt:${cycle}`, errorClass: 'SimulatedFailure', commandName: 'fake.execute', message: 'deterministic failure', evidenceIds: [] }, actor, correlationId: task.traceId });
     if (record.cycle !== cycle) throw new Error('Recovery cycle sequence diverged');
-    const simulatedExecution = executeRecoveryPlan(record.plan, succeeds ? 'SUCCEED' : 'FAIL');
-    await harness.recovery.complete({ recoveryId: record.recoveryId, taskId: task.id, succeeded: simulatedExecution.outcome === 'SUCCEED', evidenceIds: [`recovery-evidence:${task.id}:${cycle}`] });
+    const environment = recoveryEnvironments.get(task.id);
+    if (environment === undefined) throw new Error(`Missing simulated recovery environment for ${task.id}`);
+    const simulatedExecution = executeRecoveryPlan(record.plan, environment);
+    await harness.recovery.complete({ recoveryId: record.recoveryId, taskId: task.id, succeeded: simulatedExecution.succeeded, evidenceIds: [`recovery-evidence:${task.id}:${cycle}`] });
     const completedRecord = await harness.recoveryRecords.get(record.recoveryId);
     if (completedRecord === null) throw new Error('Recovery record was not persisted');
     recoveryAttempts.push({
       taskId: task.id,
       cycle,
       fingerprint: completedRecord.fingerprint,
+      failureAssumption: 'primary-agent-is-unreliable',
       selectedStrategyName: record.plan.strategyName,
       usedStrategyName: simulatedExecution.appliedStrategyName,
+      action: simulatedExecution.appliedAction,
+      succeeded: simulatedExecution.succeeded,
+      environment: simulatedExecution.environment,
       state: completedRecord.state
     });
     return recoveryAttempts.at(-1)!;
   };
-  await recoveryFor(retry, 1, false);
-  await recoveryFor(retry, 2, false);
-  const successfulAttempt = await recoveryFor(retry, 3, true);
-  for (let cycle = 1; cycle <= 5; cycle += 1) await recoveryFor(escalated, cycle, false);
+  await recoveryFor(retry, 1);
+  const successfulAttempt = await recoveryFor(retry, 2);
+  for (let cycle = 1; cycle <= 5; cycle += 1) await recoveryFor(escalated, cycle);
   const ready = transitionTask((await harness.tasks.get(independent.id))!, { type: 'TASK_READY' }, { actor, now: harness.clock.now(), evidenceIds: [], isDeployment: false });
   await harness.persistence.saveTaskAndAppend({ task: ready.task, expectedVersion: ready.task.version - 1, events: [ready.event], commands: [] });
   const started = transitionTask(ready.task, { type: 'TASK_STARTED', sessionId: importSessionId(independent.id) }, { actor, now: harness.clock.now(), evidenceIds: [], isDeployment: false });
