@@ -34,7 +34,7 @@ export interface DispatchDecision {
   correlationId: CorrelationId;
 }
 
-export interface RecoveryRequest {
+export interface DispatchRecoveryRequest {
   taskId: TaskId;
   workflowId: Task['workflowId'];
   recoveryId: string;
@@ -43,8 +43,8 @@ export interface RecoveryRequest {
   command: OutboxCommand;
 }
 
-export interface RecoveryCoordinator {
-  request(input: RecoveryRequest): Promise<void>;
+export interface DispatchRecoveryCoordinator {
+  request(input: DispatchRecoveryRequest): Promise<void>;
 }
 
 export interface DispatchOptions {
@@ -52,7 +52,7 @@ export interface DispatchOptions {
   outbox?: Outbox;
   launcher: AgentSessionLauncher;
   clock: Clock;
-  recoveryCoordinator?: RecoveryCoordinator;
+  recoveryCoordinator?: DispatchRecoveryCoordinator;
 }
 
 export interface DispatchTaskInput {

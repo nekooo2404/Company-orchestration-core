@@ -13,7 +13,7 @@ import type {
   AgentSessionLauncher,
   DispatchDecision,
   DispatchOptions,
-  RecoveryCoordinator,
+  DispatchRecoveryCoordinator,
   TaskDispatcher
 } from './dispatch';
 import { TaskDispatcher as DefaultTaskDispatcher } from './dispatch';
@@ -53,7 +53,7 @@ export interface SchedulerOptions extends DispatchOptions {
   providerHealthy?: () => boolean | Promise<boolean>;
   leaseDurationMs?: number;
   fairQueue?: FairQueueOptions;
-  recoveryCoordinator?: RecoveryCoordinator;
+  recoveryCoordinator?: DispatchRecoveryCoordinator;
   outbox?: Outbox;
   launcher: AgentSessionLauncher;
   transactionalPersistence: TransactionalPersistence;

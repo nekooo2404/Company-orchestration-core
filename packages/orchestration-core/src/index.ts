@@ -17,4 +17,7 @@ export * from './scheduler';
 export * from './channel-policy';
 export * from './communication';
 export * from './decision-records';
+export * from './failure-fingerprint';
+export * from './recovery-strategies';
+export * from './recovery';
 export * from './test-support/inmemory-store';
