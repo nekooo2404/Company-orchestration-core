@@ -40,7 +40,7 @@ const transitions = (...types: TransitionType[]): ReadonlySet<TransitionType> =>
 
 const TRANSITION_TABLE: Readonly<Record<TaskState, ReadonlySet<TransitionType>>> = {
   PENDING: transitions('TASK_READY', 'TASK_BLOCKED', 'TASK_CANCELLED'),
-  READY: transitions('TASK_STARTED', 'TASK_BLOCKED', 'TASK_CANCELLED'),
+  READY: transitions('TASK_STARTED', 'TASK_BLOCKED', 'TASK_FAILED', 'TASK_CANCELLED'),
   RUNNING: transitions(
     'TASK_REVIEW_REQUESTED',
     'TASK_COMPLETED',
