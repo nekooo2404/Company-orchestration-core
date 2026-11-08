@@ -118,9 +118,22 @@ CREATE TABLE IF NOT EXISTS approvals (
   causation_id text NOT NULL,
   state text NOT NULL,
   decision text,
+  decision_reason text,
   decided_by jsonb,
   decided_at timestamptz,
   version integer NOT NULL DEFAULT 0,
   created_at timestamptz NOT NULL,
-  updated_at timestamptz NOT NULL
+  updated_at timestamptz NOT NULL,
+  decision_idempotency_key text,
+  decision_fingerprint text
 );
+
+ALTER TABLE approvals
+  ADD COLUMN IF NOT EXISTS decision_reason text;
+ALTER TABLE approvals
+  ADD COLUMN IF NOT EXISTS decision_idempotency_key text;
+ALTER TABLE approvals
+  ADD COLUMN IF NOT EXISTS decision_fingerprint text;
+CREATE UNIQUE INDEX IF NOT EXISTS approvals_decision_idempotency_key
+  ON approvals (decision_idempotency_key)
+  WHERE decision_idempotency_key IS NOT NULL;

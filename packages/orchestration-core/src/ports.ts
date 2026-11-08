@@ -2,6 +2,7 @@ import type {
   DomainEvent,
   EventId,
   OutboxCommand as ContractOutboxCommand,
+  ApprovalRecord,
   Task,
   AgentSessionId
 } from '@aicompany/contracts';
@@ -22,8 +23,21 @@ export interface SaveTaskAndAppendInput {
   commands: readonly OutboxCommand[];
 }
 
+export interface SaveApprovalDecisionAndTaskInput {
+  approval: ApprovalRecord;
+  expectedApprovalVersion: number;
+  approvalEvent: DomainEvent;
+  task?: Task;
+  expectedTaskVersion?: number;
+  taskEvent?: DomainEvent;
+  commands: readonly OutboxCommand[];
+  idempotencyKey: string;
+  requestFingerprint: string;
+}
+
 export interface TransactionalPersistence {
   saveTaskAndAppend(input: SaveTaskAndAppendInput): Promise<void>;
+  saveApprovalDecisionAndTask(input: SaveApprovalDecisionAndTaskInput): Promise<void>;
   claimDispatch(input: DispatchClaimRequest): Promise<DispatchClaim | null>;
   releaseDispatch(taskId: Task['id'], workerId: string, leaseId: string): Promise<boolean>;
 }

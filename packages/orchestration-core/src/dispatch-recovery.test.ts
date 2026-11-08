@@ -7,7 +7,7 @@ import { createDefaultRecoveryStrategies } from './recovery-strategies';
 import { InMemoryRecoveryRecordStore, RecoveryCoordinatorService } from './recovery';
 import { InMemoryDispatchClaimStore, InMemoryEventStore, InMemoryOutbox, InMemoryTaskRepository, InMemoryTransactionalPersistence } from './test-support/inmemory-store';
 import type { AgentSession } from '@aicompany/contracts';
-import type { SaveTaskAndAppendInput, TransactionalPersistence } from './ports';
+import type { SaveApprovalDecisionAndTaskInput, SaveTaskAndAppendInput, TransactionalPersistence } from './ports';
 
 const now = new Date('2026-11-08T00:00:00.000Z');
 
@@ -42,6 +42,11 @@ class AtomicMemoryPersistence implements TransactionalPersistence {
     await this.tasks.save(input.task, input.expectedVersion);
     await this.events.append(input.events, input.expectedVersion);
     for (const command of input.commands) await this.outbox.enqueue(command);
+  }
+
+  public async saveApprovalDecisionAndTask(input: SaveApprovalDecisionAndTaskInput): Promise<void> {
+    void input;
+    throw new Error('atomic approval persistence is not used by dispatcher recovery');
   }
 
   public async claimDispatch() { return null; }

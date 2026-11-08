@@ -27,6 +27,9 @@ export const EventTypeSchema = z.enum([
   'RECOVERY_STARTED',
   'TASK_COMPLETED',
   'DEPLOYMENT_APPROVAL_REQUESTED',
+  'DEPLOYMENT_APPROVED',
+  'DEPLOYMENT_REJECTED',
+  'DEPLOYMENT_RESULT_RECORDED',
   'APPROVAL_REQUESTED',
   'TASK_ESCALATED',
   'TASK_CANCELLED',
@@ -87,6 +90,19 @@ export const DeploymentApprovalRequestedPayloadSchema = z.object({
   approvalId: ApprovalIdSchema,
   taskId: TaskIdSchema
 });
+export const DeploymentApprovedPayloadSchema = z.object({
+  approvalId: ApprovalIdSchema,
+  taskId: TaskIdSchema
+});
+export const DeploymentRejectedPayloadSchema = z.object({
+  approvalId: ApprovalIdSchema,
+  taskId: TaskIdSchema,
+  reason: nonEmptyText
+});
+export const DeploymentResultRecordedPayloadSchema = z.object({
+  taskId: TaskIdSchema,
+  evidenceIds: nonEmptyTextArray
+});
 export const ApprovalRequestedPayloadSchema = z.object({
   approvalId: ApprovalIdSchema,
   subjectType: ApprovalSubjectTypeSchema,
@@ -130,11 +146,13 @@ export const AgentSessionCancelledPayloadSchema = z.object({
 });
 export const ApprovalApprovedPayloadSchema = z.object({
   approvalId: ApprovalIdSchema,
+  decisionReason: nonEmptyText.optional(),
   decidedAt: z.date().optional()
 });
 export const ApprovalRejectedPayloadSchema = z.object({
   approvalId: ApprovalIdSchema,
-  reason: nonEmptyText
+  reason: nonEmptyText,
+  decisionReason: nonEmptyText.optional()
 });
 
 export const EventPayloadSchema = z.union([
@@ -149,6 +167,9 @@ export const EventPayloadSchema = z.union([
   RecoveryStartedPayloadSchema,
   TaskCompletedPayloadSchema,
   DeploymentApprovalRequestedPayloadSchema,
+  DeploymentApprovedPayloadSchema,
+  DeploymentRejectedPayloadSchema,
+  DeploymentResultRecordedPayloadSchema,
   ApprovalRequestedPayloadSchema,
   TaskEscalatedPayloadSchema,
   TaskCancelledPayloadSchema,
@@ -190,6 +211,21 @@ export const DomainEventSchema = z.discriminatedUnion('eventType', [
     ...eventAuditFields,
     eventType: z.literal('DEPLOYMENT_APPROVAL_REQUESTED'),
     payload: DeploymentApprovalRequestedPayloadSchema
+  }),
+  z.object({
+    ...eventAuditFields,
+    eventType: z.literal('DEPLOYMENT_APPROVED'),
+    payload: DeploymentApprovedPayloadSchema
+  }),
+  z.object({
+    ...eventAuditFields,
+    eventType: z.literal('DEPLOYMENT_REJECTED'),
+    payload: DeploymentRejectedPayloadSchema
+  }),
+  z.object({
+    ...eventAuditFields,
+    eventType: z.literal('DEPLOYMENT_RESULT_RECORDED'),
+    payload: DeploymentResultRecordedPayloadSchema
   }),
   z.object({ ...eventAuditFields, eventType: z.literal('APPROVAL_REQUESTED'), payload: ApprovalRequestedPayloadSchema }),
   z.object({ ...eventAuditFields, eventType: z.literal('TASK_ESCALATED'), payload: TaskEscalatedPayloadSchema }),

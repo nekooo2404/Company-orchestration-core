@@ -1,10 +1,12 @@
 import { Pool, type PoolClient, type QueryResultRow } from 'pg';
 import {
+  ApprovalRecordSchema,
   DomainEventSchema,
   TaskSchema,
   agentSessionId,
   type DomainEvent,
   type EventId,
+  type ApprovalRecord,
   type OutboxCommand,
   type Task
 } from '@aicompany/contracts';
@@ -14,6 +16,7 @@ import {
   OptimisticConcurrencyError,
   type EventStore,
   type SaveTaskAndAppendInput,
+  type SaveApprovalDecisionAndTaskInput,
   type DispatchClaim,
   type DispatchClaimRequest,
   type TransactionalPersistence
@@ -250,6 +253,18 @@ interface PreparedSaveTaskAndAppendInput {
   commands: OutboxCommand[];
 }
 
+interface PreparedSaveApprovalDecisionAndTaskInput {
+  approval: ApprovalRecord;
+  expectedApprovalVersion: number;
+  approvalEvent: DomainEvent;
+  task?: Task;
+  expectedTaskVersion?: number;
+  taskEvent?: DomainEvent;
+  commands: OutboxCommand[];
+  idempotencyKey: string;
+  requestFingerprint: string;
+}
+
 const prepareSaveTaskAndAppend = (
   input: SaveTaskAndAppendInput
 ): PreparedSaveTaskAndAppendInput => {
@@ -283,6 +298,53 @@ const prepareSaveTaskAndAppend = (
   }
 
   return { task, expectedVersion: input.expectedVersion, events, commands };
+};
+
+const prepareSaveApprovalDecisionAndTask = (
+  input: SaveApprovalDecisionAndTaskInput
+): PreparedSaveApprovalDecisionAndTaskInput => {
+  assertVersion(input.expectedApprovalVersion, 'expectedApprovalVersion');
+  const idempotencyKey = canonicalId(input.idempotencyKey, 'idempotencyKey');
+  const requestFingerprint = canonicalId(input.requestFingerprint, 'requestFingerprint');
+  const approval = ApprovalRecordSchema.parse(input.approval);
+  const approvalEvent = parseDomainEvent(input.approvalEvent);
+  if (
+    approvalEvent.aggregateId !== approval.approvalId ||
+    approvalEvent.aggregateVersion !== input.expectedApprovalVersion + 1
+  ) {
+    throw new InvalidPersistenceOperationError('Approval event does not match the approval decision version');
+  }
+
+  const hasTask = input.task !== undefined;
+  const hasTaskEvent = input.taskEvent !== undefined;
+  const hasTaskVersion = input.expectedTaskVersion !== undefined;
+  if (hasTask !== hasTaskEvent || hasTask !== hasTaskVersion) {
+    throw new InvalidPersistenceOperationError('Atomic approval task fields must be provided together');
+  }
+
+  const task = input.task === undefined ? undefined : parseTask(input.task);
+  const taskEvent = input.taskEvent === undefined ? undefined : parseDomainEvent(input.taskEvent);
+  if (task !== undefined && taskEvent !== undefined && input.expectedTaskVersion !== undefined) {
+    assertVersion(input.expectedTaskVersion, 'expectedTaskVersion');
+    if (
+      taskEvent.aggregateId !== task.id ||
+      taskEvent.aggregateVersion !== input.expectedTaskVersion + 1
+    ) {
+      throw new InvalidPersistenceOperationError('Task event does not match the deployment transition version');
+    }
+  }
+
+  return {
+    approval,
+    expectedApprovalVersion: input.expectedApprovalVersion,
+    approvalEvent,
+    ...(task === undefined ? {} : { task }),
+    ...(input.expectedTaskVersion === undefined ? {} : { expectedTaskVersion: input.expectedTaskVersion }),
+    ...(taskEvent === undefined ? {} : { taskEvent }),
+    commands: input.commands.map(parseOutboxCommand),
+    idempotencyKey,
+    requestFingerprint
+  };
 };
 
 const lockAggregate = async (client: PoolClient, aggregateId: string): Promise<void> => {
@@ -346,6 +408,83 @@ export const saveTaskSnapshot = async (
   }
 }
 
+const saveApprovalDecision = async (
+  client: PoolClient,
+  input: PreparedSaveApprovalDecisionAndTaskInput
+): Promise<boolean> => {
+  const existing = await client.query<{
+    version: number;
+    decision_idempotency_key: string | null;
+    decision_fingerprint: string | null;
+  }>(
+    `SELECT version, decision_idempotency_key, decision_fingerprint
+     FROM approvals
+     WHERE approval_id = $1
+     FOR UPDATE`,
+    [input.approval.approvalId]
+  );
+  const row = existing.rows[0];
+  if (row === undefined) {
+    throw new InvalidPersistenceOperationError(`Approval ${input.approval.approvalId} was not found`);
+  }
+  if (row.decision_idempotency_key !== null) {
+    if (
+      row.decision_idempotency_key !== input.idempotencyKey ||
+      row.decision_fingerprint !== input.requestFingerprint
+    ) {
+      throw new DuplicatePersistenceIdError('approval decision', input.idempotencyKey);
+    }
+    return true;
+  }
+  if (row.version !== input.expectedApprovalVersion) {
+    throw new OptimisticConcurrencyError(
+      input.approval.approvalId,
+      input.expectedApprovalVersion,
+      row.version
+    );
+  }
+  if (input.approval.version !== input.expectedApprovalVersion + 1) {
+    throw new InvalidPersistenceOperationError(
+      `Approval ${input.approval.approvalId} must have version ${input.expectedApprovalVersion + 1}`
+    );
+  }
+
+  const updated = await client.query(
+    `UPDATE approvals
+     SET state = $2,
+         decision = $3,
+         decision_reason = $4,
+         decided_by = $5,
+         decided_at = $6,
+         version = $7,
+         updated_at = $8,
+         decision_idempotency_key = $9,
+         decision_fingerprint = $10
+     WHERE approval_id = $1 AND version = $11 AND decision_idempotency_key IS NULL`,
+    [
+      input.approval.approvalId,
+      input.approval.state,
+      input.approval.decision,
+      input.approval.decisionReason,
+      input.approval.decidedBy === null ? null : json(input.approval.decidedBy),
+      input.approval.decidedAt,
+      input.approval.version,
+      input.approval.updatedAt,
+      input.idempotencyKey,
+      input.requestFingerprint,
+      input.expectedApprovalVersion
+    ]
+  );
+  if (updated.rowCount !== 1) {
+    throw new OptimisticConcurrencyError(
+      input.approval.approvalId,
+      input.expectedApprovalVersion,
+      row.version
+    );
+  }
+  return false;
+};
+
 export class PostgresStore implements EventStore, TransactionalPersistence {
   public constructor(private readonly pool: Pool) {}
 
@@ -407,6 +546,32 @@ export class PostgresStore implements EventStore, TransactionalPersistence {
       await saveTaskSnapshot(client, prepared.task, prepared.expectedVersion);
       await this.appendEvents(client, prepared.events, prepared.expectedVersion);
       await this.enqueueCommands(client, prepared.commands);
+      await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK').catch(() => undefined);
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  public async saveApprovalDecisionAndTask(input: SaveApprovalDecisionAndTaskInput): Promise<void> {
+    const prepared = prepareSaveApprovalDecisionAndTask(input);
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      await lockAggregate(client, prepared.approval.approvalId);
+      const alreadyApplied = await saveApprovalDecision(client, prepared);
+      if (!alreadyApplied) {
+        if (prepared.task !== undefined && prepared.expectedTaskVersion !== undefined) {
+          await saveTaskSnapshot(client, prepared.task, prepared.expectedTaskVersion);
+        }
+        await this.appendEvents(client, [prepared.approvalEvent], prepared.expectedApprovalVersion);
+        if (prepared.taskEvent !== undefined && prepared.expectedTaskVersion !== undefined) {
+          await this.appendEvents(client, [prepared.taskEvent], prepared.expectedTaskVersion);
+        }
+        await this.enqueueCommands(client, prepared.commands);
+      }
       await client.query('COMMIT');
     } catch (error) {
       await client.query('ROLLBACK').catch(() => undefined);

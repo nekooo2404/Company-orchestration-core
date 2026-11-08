@@ -1,54 +1,111 @@
-import { ActorRefSchema, AgentDefinitionIdSchema, TaskIdSchema, WorkflowIdSchema, correlationId, type ActorRef, type AgentDefinitionId, type TaskId, type WorkflowId } from '@aicompany/contracts';
-
-export interface CeoCommandService {
-  pauseWorkflow(workflowId: WorkflowId, reason: string): Promise<void>;
-  resumeWorkflow(workflowId: WorkflowId): Promise<void>;
-  cancelTask(taskId: TaskId, reason: string): Promise<void>;
-  reassignTask(taskId: TaskId, agentDefinitionId: AgentDefinitionId): Promise<void>;
-}
+import {
+  ActorRefSchema,
+  AgentDefinitionIdSchema,
+  CorrelationIdSchema,
+  TaskIdSchema,
+  WorkflowIdSchema,
+  type ActorRef,
+  type AgentDefinitionId,
+  type CorrelationId,
+  type TaskId,
+  type WorkflowId
+} from '@aicompany/contracts';
 
 export interface CeoCommandEnvelope {
-  command: 'pauseWorkflow' | 'resumeWorkflow' | 'cancelTask' | 'reassignTask';
-  targetId: string;
   actor: ActorRef;
   reason: string;
   idempotencyKey: string;
-  correlationId: ReturnType<typeof correlationId>;
-  agentDefinitionId?: AgentDefinitionId;
-}
-export interface CeoCommandExecutor { execute(command: CeoCommandEnvelope): Promise<void> }
-export interface InMemoryCeoCommandOptions {
-  actor: ActorRef;
-  execute: CeoCommandExecutor['execute'];
-  idempotency?: Map<string, Promise<void>>;
-  correlationId?: CeoCommandEnvelope['correlationId'];
+  correlationId: CorrelationId;
 }
 
-export class CeoAuthorizationError extends Error { public constructor() { super('Only the CEO may issue orchestration commands'); this.name = 'CeoAuthorizationError'; } }
+export type PauseWorkflowCommand = CeoCommandEnvelope & { workflowId: WorkflowId };
+export type ResumeWorkflowCommand = CeoCommandEnvelope & { workflowId: WorkflowId };
+export type CancelTaskCommand = CeoCommandEnvelope & { taskId: TaskId };
+export type ReassignTaskCommand = CeoCommandEnvelope & {
+  taskId: TaskId;
+  agentDefinitionId: AgentDefinitionId;
+};
+
+export type CeoCommand =
+  | (PauseWorkflowCommand & { command: 'pauseWorkflow' })
+  | (ResumeWorkflowCommand & { command: 'resumeWorkflow' })
+  | (CancelTaskCommand & { command: 'cancelTask' })
+  | (ReassignTaskCommand & { command: 'reassignTask' });
+
+export interface CeoCommandService {
+  pauseWorkflow(input: PauseWorkflowCommand): Promise<void>;
+  resumeWorkflow(input: ResumeWorkflowCommand): Promise<void>;
+  cancelTask(input: CancelTaskCommand): Promise<void>;
+  reassignTask(input: ReassignTaskCommand): Promise<void>;
+}
+
+export interface CeoCommandExecutor {
+  execute(command: CeoCommand): Promise<void>;
+}
+
+export class CeoAuthorizationError extends Error {
+  public constructor() {
+    super('Only the CEO may issue orchestration commands');
+    this.name = 'CeoAuthorizationError';
+  }
+}
+
+export class CeoCommandIdempotencyError extends Error {
+  public constructor() {
+    super('Idempotency key was reused with different CEO command data');
+    this.name = 'CeoCommandIdempotencyError';
+  }
+}
 
 export class InMemoryCeoCommandService implements CeoCommandService {
-  private readonly completed: Map<string, Promise<void>>;
-  private readonly actor: ActorRef;
-  private readonly correlation: CeoCommandEnvelope['correlationId'];
-  public constructor(private readonly options: InMemoryCeoCommandOptions) {
-    this.actor = ActorRefSchema.parse(options.actor);
-    this.completed = options.idempotency ?? new Map();
-    this.correlation = options.correlationId ?? correlationId('ceo-command');
-  }
-  public async pauseWorkflow(id: WorkflowId, reason: string): Promise<void> { await this.issue('pauseWorkflow', WorkflowIdSchema.parse(id), reason); }
-  public async resumeWorkflow(id: WorkflowId): Promise<void> { await this.issue('resumeWorkflow', WorkflowIdSchema.parse(id), 'Resume workflow'); }
-  public async cancelTask(id: TaskId, reason: string): Promise<void> { await this.issue('cancelTask', TaskIdSchema.parse(id), reason); }
-  public async reassignTask(id: TaskId, agent: AgentDefinitionId): Promise<void> { await this.issue('reassignTask', TaskIdSchema.parse(id), 'Reassign task', AgentDefinitionIdSchema.parse(agent)); }
+  private readonly operations = new Map<string, { fingerprint: string; result: Promise<void> }>();
 
-  private async issue(command: CeoCommandEnvelope['command'], targetId: string, reason: string, agentDefinitionId?: AgentDefinitionId): Promise<void> {
-    if (this.actor.kind !== 'CEO') throw new CeoAuthorizationError();
-    const actualReason = reason;
-    if (!actualReason.trim()) throw new Error('CEO command reason is required');
-    const key = `ceo:${command}:${targetId}:${actualReason.trim()}:${agentDefinitionId ?? ''}`;
-    const existing = this.completed.get(key);
-    if (existing) return existing;
-    const pending = this.options.execute({ command, targetId, actor: this.actor, reason: actualReason.trim(), idempotencyKey: key, correlationId: this.correlation, ...(agentDefinitionId ? { agentDefinitionId } : {}) });
-    this.completed.set(key, pending);
-    try { await pending; } catch (error) { this.completed.delete(key); throw error; }
+  public constructor(private readonly options: { execute: CeoCommandExecutor['execute'] }) {}
+
+  public async pauseWorkflow(input: PauseWorkflowCommand): Promise<void> {
+    await this.issue({ ...input, workflowId: WorkflowIdSchema.parse(input.workflowId), command: 'pauseWorkflow' });
+  }
+
+  public async resumeWorkflow(input: ResumeWorkflowCommand): Promise<void> {
+    await this.issue({ ...input, workflowId: WorkflowIdSchema.parse(input.workflowId), command: 'resumeWorkflow' });
+  }
+
+  public async cancelTask(input: CancelTaskCommand): Promise<void> {
+    await this.issue({ ...input, taskId: TaskIdSchema.parse(input.taskId), command: 'cancelTask' });
+  }
+
+  public async reassignTask(input: ReassignTaskCommand): Promise<void> {
+    await this.issue({
+      ...input,
+      taskId: TaskIdSchema.parse(input.taskId),
+      agentDefinitionId: AgentDefinitionIdSchema.parse(input.agentDefinitionId),
+      command: 'reassignTask'
+    });
+  }
+
+  private async issue(command: CeoCommand): Promise<void> {
+    const actor = ActorRefSchema.parse(command.actor);
+    CorrelationIdSchema.parse(command.correlationId);
+    const reason = command.reason.trim();
+    const idempotencyKey = command.idempotencyKey.trim();
+    if (actor.kind !== 'CEO') throw new CeoAuthorizationError();
+    if (!reason || !idempotencyKey) throw new Error('CEO command reason and idempotency key are required');
+
+    const normalized = { ...command, actor, reason, idempotencyKey };
+    const fingerprint = JSON.stringify(normalized);
+    const prior = this.operations.get(idempotencyKey);
+    if (prior !== undefined) {
+      if (prior.fingerprint !== fingerprint) throw new CeoCommandIdempotencyError();
+      return prior.result;
+    }
+
+    const result = Promise.resolve().then(() => this.options.execute(normalized));
+    this.operations.set(idempotencyKey, { fingerprint, result });
+    try {
+      await result;
+    } catch (error) {
+      this.operations.delete(idempotencyKey);
+      throw error;
+    }
   }
 }

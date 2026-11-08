@@ -224,7 +224,7 @@ export class RecoveryCoordinatorService implements RecoveryCoordinator {
       reason: escalationReason,
       requestedBy: input.actor, correlationId: CorrelationIdSchema.parse(input.correlationId),
       causationId: EventIdSchema.parse(transition.event.eventId), version: 0,
-      createdAt: now, updatedAt: now, state: 'PENDING', decision: null, decidedBy: null, decidedAt: null
+      createdAt: now, updatedAt: now, state: 'PENDING', decision: null, decisionReason: null, decidedBy: null, decidedAt: null
     });
     const command = {
       commandId: `request-recovery-escalation:${id}`,

@@ -1,11 +1,20 @@
 import { describe, expect, it } from 'vitest';
 import {
-  agentDefinitionId, agentSessionId, correlationId, taskId, workflowId,
+  agentDefinitionId,
+  agentSessionId,
+  correlationId,
+  taskId,
+  workflowId,
   type Task
 } from '@aicompany/contracts';
-import { InMemoryTaskRepository } from './test-support/inmemory-store';
+import {
+  InMemoryApprovalTransactionalPersistence,
+  InMemoryEventStore,
+  InMemoryOutbox,
+  InMemoryTaskRepository
+} from './test-support/inmemory-store';
 import { InMemoryApprovalStore, ApprovalServiceError, ApprovalServiceImpl } from './approvals';
-import { InMemoryCeoCommandService } from './ceo-commands';
+import { InMemoryCeoCommandService, type CeoCommand } from './ceo-commands';
 
 const now = new Date('2026-11-08T00:00:00Z');
 const task: Task = {
@@ -21,20 +30,21 @@ const approvalInput = {
   requestedBy: actor, correlationId: task.traceId, idempotencyKey: 'request-1'
 };
 
-const service = () => {
+const service = (failAfter?: 'after-approval' | 'after-task' | 'after-approval-event' | 'after-task-event' | 'after-outbox') => {
   const tasks = new InMemoryTaskRepository();
-  const events: Array<{ eventType?: string; payload?: unknown }> = [];
-  const commands: Array<{ type?: string }> = [];
-  void tasks.save(task, 0);
-  const persistence = {
-    async saveTaskAndAppend(input: { task: Task; expectedVersion: number; events: readonly import('@aicompany/contracts').DomainEvent[]; commands: readonly import('@aicompany/contracts').OutboxCommand[] }) {
-      await tasks.save(input.task, input.expectedVersion); events.push(...input.events); commands.push(...input.commands);
-    }, async claimDispatch() { return null; }, async releaseDispatch() { return false; }
-  };
+  const events = new InMemoryEventStore();
+  const outbox = new InMemoryOutbox({ now: () => now });
   const approvals = new InMemoryApprovalStore();
+  void tasks.save(task, 0);
+  const persistence = new InMemoryApprovalTransactionalPersistence({ tasks, events, outbox, approvals, failAfter });
   const instance = new ApprovalServiceImpl({ approvals, taskRepository: tasks, transactionalPersistence: persistence, now: () => now });
-  return { instance, approvals, tasks, events, commands };
+  return { instance, approvals, tasks, events, outbox, persistence };
 };
+
+const approve = (approvalId: string, idempotencyKey = 'decision-approve') => ({
+  approvalId: approvalId as never, decision: 'APPROVE' as const, actor: { kind: 'CEO' as const },
+  reason: 'approved', expectedVersion: 0, idempotencyKey
+});
 
 describe('ApprovalServiceImpl', () => {
   it('returns the same approval for an identical idempotent request', async () => {
@@ -46,46 +56,70 @@ describe('ApprovalServiceImpl', () => {
     await expect(instance.request({ ...approvalInput, reason: 'Different request' })).rejects.toThrow(/idempotency key/i);
   });
 
-  it('requires CEO decisions, checks optimistic versions, and records approve or reject', async () => {
-    const { instance, events, commands, tasks } = service();
-    const approval = await instance.request(approvalInput);
-    await expect(instance.decide({ approvalId: approval.approvalId, decision: 'APPROVE', actor, reason: 'ok', expectedVersion: 0, idempotencyKey: 'decision-1' }))
-      .rejects.toBeInstanceOf(ApprovalServiceError);
-    const approved = await instance.decide({ approvalId: approval.approvalId, decision: 'APPROVE', actor: { kind: 'CEO' }, reason: 'approved', expectedVersion: 0, idempotencyKey: 'decision-1' });
-    expect(approved).toMatchObject({ state: 'APPROVED', version: 1, decision: 'APPROVE' });
-    expect(events).toHaveLength(1);
-    expect(commands).toHaveLength(1);
-    expect(await tasks.get(task.id)).toMatchObject({ state: 'COMPLETED', version: 1 });
-    expect(commands[0]).toMatchObject({ type: 'DEPLOY' });
-    await expect(instance.decide({ approvalId: approval.approvalId, decision: 'APPROVE', actor: { kind: 'CEO' }, reason: 'approved', expectedVersion: 0, idempotencyKey: 'decision-1' }))
-      .resolves.toEqual(approved);
-    expect(commands).toHaveLength(1);
-    await expect(instance.decide({ approvalId: approval.approvalId, decision: 'REJECT', actor: { kind: 'CEO' }, reason: 'no', expectedVersion: 0, idempotencyKey: 'decision-2' }))
-      .rejects.toThrow(/version|stale/i);
+  it('atomically approves a deployment, keeps it running, and emits one DEPLOY command', async () => {
+    const { instance, approvals, tasks, events, outbox } = service();
+    const requested = await instance.request(approvalInput);
+    const approved = await instance.decide(approve(requested.approvalId));
+    expect(approved).toMatchObject({ state: 'APPROVED', version: 1, decision: 'APPROVE', reason: 'Release staging', decisionReason: 'approved' });
+    expect(await tasks.get(task.id)).toMatchObject({ state: 'RUNNING', version: 1 });
+    expect(await events.readStream(requested.approvalId)).toEqual(expect.arrayContaining([expect.objectContaining({ eventType: 'APPROVAL_APPROVED', payload: expect.objectContaining({ decisionReason: 'approved' }) })]));
+    expect(await events.readStream(task.id)).toEqual(expect.arrayContaining([expect.objectContaining({ eventType: 'DEPLOYMENT_APPROVED' })]));
+    expect(await outbox.claim(10, 'deploy-worker')).toEqual([expect.objectContaining({ type: 'DEPLOY', payload: { taskId: task.id, approvalId: requested.approvalId } })]);
+    expect(await approvals.get(requested.approvalId)).toEqual(approved);
   });
 
-  it('returns a deployment task to review with the rejection reason', async () => {
-    const { instance, tasks, events } = service();
+  it('requires CEO decisions, checks optimistic versions, and replays the same decision idempotently', async () => {
+    const { instance, outbox } = service();
     const approval = await instance.request(approvalInput);
-    await instance.decide({ approvalId: approval.approvalId, decision: 'REJECT', actor: { kind: 'CEO' }, reason: 'Missing rollback plan', expectedVersion: 0, idempotencyKey: 'decision-reject' });
+    await expect(instance.decide({ ...approve(approval.approvalId), actor })).rejects.toBeInstanceOf(ApprovalServiceError);
+    const approved = await instance.decide(approve(approval.approvalId));
+    await expect(instance.decide(approve(approval.approvalId))).resolves.toEqual(approved);
+    await expect(instance.decide(approve(approval.approvalId, 'decision-stale'))).rejects.toThrow(/version|pending/i);
+    expect(await outbox.claim(10, 'deploy-worker')).toHaveLength(1);
+  });
+
+  it('returns a deployment task to review while preserving request and decision reasons', async () => {
+    const { instance, approvals, tasks, events } = service();
+    const requested = await instance.request(approvalInput);
+    const rejected = await instance.decide({ ...approve(requested.approvalId, 'decision-reject'), decision: 'REJECT', reason: 'Missing rollback plan' });
+    expect(rejected).toMatchObject({ state: 'REJECTED', reason: 'Release staging', decisionReason: 'Missing rollback plan' });
     expect(await tasks.get(task.id)).toMatchObject({ state: 'REVIEW', version: 1 });
-    expect(events).toEqual(expect.arrayContaining([expect.objectContaining({ eventType: 'APPROVAL_REJECTED', payload: expect.objectContaining({ reason: 'Missing rollback plan' }) })]));
+    expect(await approvals.get(requested.approvalId)).toMatchObject({ reason: 'Release staging', decisionReason: 'Missing rollback plan' });
+    expect(await events.readStream(task.id)).toEqual(expect.arrayContaining([expect.objectContaining({ eventType: 'DEPLOYMENT_REJECTED', payload: expect.objectContaining({ reason: 'Missing rollback plan' }) })]));
   });
 
-  it('does not emit duplicate commands for a repeated CEO command key', async () => {
-    const calls: string[] = [];
-    const commands = new InMemoryCeoCommandService({ actor: { kind: 'CEO' }, idempotency: new Map(), execute: async (name) => { calls.push(name); } });
-    await commands.pauseWorkflow(workflowId('workflow-1'), 'maintenance');
-    await commands.pauseWorkflow(workflowId('workflow-1'), 'maintenance');
+  it('rolls back approval, task, events, and outbox when atomic persistence fails', async () => {
+    const { instance, approvals, tasks, events, outbox } = service('after-task');
+    const requested = await instance.request(approvalInput);
+    await expect(instance.decide(approve(requested.approvalId))).rejects.toThrow(/injected atomic approval failure/i);
+    expect(await approvals.get(requested.approvalId)).toMatchObject({ state: 'PENDING', version: 0, decisionReason: null });
+    expect(await tasks.get(task.id)).toMatchObject({ state: 'WAITING_FOR_APPROVAL', version: 0 });
+    expect(await events.readStream(requested.approvalId)).toEqual([]);
+    expect(await events.readStream(task.id)).toEqual([]);
+    expect(await outbox.claim(10, 'rollback-check')).toEqual([]);
+  });
+
+  it('does not emit duplicate commands for repeated CEO input and rejects changed reuse', async () => {
+    const calls: CeoCommand[] = [];
+    const commands = new InMemoryCeoCommandService({ execute: async (command) => { calls.push(command); } });
+    const input = {
+      workflowId: workflowId('workflow-1'), actor: { kind: 'CEO' } as const,
+      reason: 'maintenance', idempotencyKey: 'ceo-command-1', correlationId: correlationId('ceo-trace-1')
+    };
+    await commands.pauseWorkflow(input);
+    await commands.pauseWorkflow(input);
     expect(calls).toHaveLength(1);
-    expect(calls[0]).toMatchObject({ command: 'pauseWorkflow', actor: { kind: 'CEO' }, reason: 'maintenance', idempotencyKey: expect.any(String), correlationId: expect.any(String) });
+    expect(calls[0]).toMatchObject({ command: 'pauseWorkflow', actor: { kind: 'CEO' }, reason: 'maintenance', idempotencyKey: 'ceo-command-1', correlationId: correlationId('ceo-trace-1') });
+    await expect(commands.pauseWorkflow({ ...input, reason: 'changed' })).rejects.toThrow(/idempotency/i);
+    await expect(commands.pauseWorkflow({ ...input, correlationId: correlationId('ceo-trace-2') })).rejects.toThrow(/idempotency/i);
   });
 
-  it('rejects every CEO command from a non-CEO actor', async () => {
-    const commands = new InMemoryCeoCommandService({ actor, idempotency: new Map(), execute: async () => undefined });
-    await expect(commands.cancelTask(taskId('task-1'), 'reason')).rejects.toThrow(/CEO/i);
-    await expect(commands.pauseWorkflow(workflowId('workflow-1'), 'reason')).rejects.toThrow(/CEO/i);
-    await expect(commands.resumeWorkflow(workflowId('workflow-1'))).rejects.toThrow(/CEO/i);
-    await expect(commands.reassignTask(taskId('task-1'), agentDefinitionId('agent-2'))).rejects.toThrow(/CEO/i);
+  it('enforces CEO authentication separately for every command invocation', async () => {
+    const commands = new InMemoryCeoCommandService({ execute: async () => undefined });
+    const envelope = { actor, reason: 'reason', idempotencyKey: 'non-ceo-1', correlationId: correlationId('non-ceo-trace') };
+    await expect(commands.cancelTask({ ...envelope, taskId: taskId('task-1') })).rejects.toThrow(/CEO/i);
+    await expect(commands.pauseWorkflow({ ...envelope, workflowId: workflowId('workflow-1') })).rejects.toThrow(/CEO/i);
+    await expect(commands.resumeWorkflow({ ...envelope, workflowId: workflowId('workflow-1') })).rejects.toThrow(/CEO/i);
+    await expect(commands.reassignTask({ ...envelope, taskId: taskId('task-1'), agentDefinitionId: agentDefinitionId('agent-2') })).rejects.toThrow(/CEO/i);
   });
 });

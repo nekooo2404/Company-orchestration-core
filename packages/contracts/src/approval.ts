@@ -6,6 +6,8 @@ import {
 } from './ids';
 import { ActorRefSchema } from './agent';
 
+const nonEmptyText = z.string().refine((value) => value.trim().length > 0);
+
 export const ApprovalSubjectTypeSchema = z.enum([
   'CAPABILITY',
   'DEPLOYMENT',
@@ -43,6 +45,7 @@ export const ApprovalRecordSchema = z.discriminatedUnion('state', [
     ...approvalAuditFields,
     state: z.literal('PENDING'),
     decision: z.null(),
+    decisionReason: z.null(),
     decidedBy: z.null(),
     decidedAt: z.null()
   }),
@@ -50,6 +53,7 @@ export const ApprovalRecordSchema = z.discriminatedUnion('state', [
     ...approvalAuditFields,
     state: z.literal('APPROVED'),
     decision: z.literal('APPROVE'),
+    decisionReason: nonEmptyText,
     decidedBy: ActorRefSchema,
     decidedAt: z.date()
   }),
@@ -57,6 +61,7 @@ export const ApprovalRecordSchema = z.discriminatedUnion('state', [
     ...approvalAuditFields,
     state: z.literal('REJECTED'),
     decision: z.literal('REJECT'),
+    decisionReason: nonEmptyText,
     decidedBy: ActorRefSchema,
     decidedAt: z.date()
   }),
@@ -64,6 +69,7 @@ export const ApprovalRecordSchema = z.discriminatedUnion('state', [
     ...approvalAuditFields,
     state: z.literal('EXPIRED'),
     decision: z.null(),
+    decisionReason: z.null(),
     decidedBy: ActorRefSchema,
     decidedAt: z.date()
   }),
@@ -71,6 +77,7 @@ export const ApprovalRecordSchema = z.discriminatedUnion('state', [
     ...approvalAuditFields,
     state: z.literal('CANCELLED'),
     decision: z.null(),
+    decisionReason: z.null(),
     decidedBy: ActorRefSchema,
     decidedAt: z.date()
   })

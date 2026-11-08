@@ -8,7 +8,7 @@ import {
 import {
   InMemoryRecoveryRecordStore, RecoveryCoordinatorService
 } from './recovery';
-import type { SaveTaskAndAppendInput, TransactionalPersistence } from './ports';
+import type { SaveApprovalDecisionAndTaskInput, SaveTaskAndAppendInput, TransactionalPersistence } from './ports';
 import { createDefaultRecoveryStrategies } from './recovery-strategies';
 
 const now = new Date('2026-11-08T10:00:00.000Z');
@@ -32,6 +32,11 @@ class RecoveryTestPersistence implements TransactionalPersistence {
     await this.tasks.save(input.task, input.expectedVersion);
     await this.events.append(input.events, input.expectedVersion);
     for (const command of input.commands) await this.outbox.enqueue(command);
+  }
+
+  public async saveApprovalDecisionAndTask(input: SaveApprovalDecisionAndTaskInput): Promise<void> {
+    void input;
+    throw new Error('atomic approval persistence is not used by recovery');
   }
 
   public async claimDispatch(): Promise<null> { return null; }

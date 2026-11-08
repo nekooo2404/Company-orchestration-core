@@ -21,7 +21,7 @@ export * from './failure-fingerprint';
 export * from './recovery-strategies';
 export * from './recovery';
 export { DEFAULT_CAPABILITY_POLICY, InMemoryCapabilityPolicy } from './capability-policy';
-export type { CapabilityRequest, CapabilityDecision, CapabilityApprovalRequester, CapabilityPolicy as CapabilityEvaluationPolicy } from './capability-policy';
+export type { CapabilityRequest, CapabilityDecision, CapabilityPolicy as CapabilityEvaluationPolicy } from './capability-policy';
 export * from './approvals';
 export * from './ceo-commands';
 export * from './test-support/inmemory-store';

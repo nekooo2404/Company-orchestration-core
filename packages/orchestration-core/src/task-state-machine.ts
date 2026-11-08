@@ -24,7 +24,8 @@ export type TaskTransition =
   | { type: 'TASK_CANCELLED'; reason: string }
   | { type: 'APPROVAL_REQUESTED'; approvalId: ApprovalId }
   | { type: 'DEPLOYMENT_APPROVED'; approvalId: ApprovalId; approvalRecord: ApprovalRecord }
-  | { type: 'DEPLOYMENT_REJECTED'; approvalId: ApprovalId; reason: string; approvalRecord: ApprovalRecord };
+  | { type: 'DEPLOYMENT_REJECTED'; approvalId: ApprovalId; reason: string; approvalRecord: ApprovalRecord }
+  | { type: 'DEPLOYMENT_RESULT_RECORDED'; evidenceIds: string[] };
 
 export interface TransitionContext {
   actor: ActorRef;
@@ -47,6 +48,7 @@ const TRANSITION_TABLE: Readonly<Record<TaskState, ReadonlySet<TransitionType>>>
   RUNNING: transitions(
     'TASK_REVIEW_REQUESTED',
     'TASK_COMPLETED',
+    'DEPLOYMENT_RESULT_RECORDED',
     'TASK_BLOCKED',
     'TASK_FAILED',
     'TASK_CANCELLED'
@@ -161,6 +163,9 @@ export function transitionTask(
       }
 
       if (isDeployment) {
+        if (task.state === 'RUNNING') {
+          invalid(task, transition, 'deployment completion requires a verified deployment result');
+        }
         nextState = 'WAITING_FOR_APPROVAL';
         eventType = 'DEPLOYMENT_APPROVAL_REQUESTED';
         payload = {
@@ -239,15 +244,23 @@ export function transitionTask(
       if (!isDeployment || transition.approvalRecord.state !== 'APPROVED' || transition.approvalRecord.subjectType !== 'DEPLOYMENT' || transition.approvalRecord.subjectId !== task.id || transition.approvalRecord.approvalId !== transition.approvalId) {
         invalid(task, transition, 'an approved deployment record matching this task is required');
       }
-      nextState = 'COMPLETED';
-      eventType = 'TASK_COMPLETED';
-      payload = { evidenceIds: [`approval:${transition.approvalId}`], taskId: task.id };
+      nextState = 'RUNNING';
+      eventType = 'DEPLOYMENT_APPROVED';
+      payload = { approvalId: transition.approvalId, taskId: task.id };
       break;
     case 'DEPLOYMENT_REJECTED':
       if (!isDeployment || !nonEmpty(transition.reason) || transition.approvalRecord.state !== 'REJECTED' || transition.approvalRecord.subjectType !== 'DEPLOYMENT' || transition.approvalRecord.subjectId !== task.id || transition.approvalRecord.approvalId !== transition.approvalId) invalid(task, transition, 'a rejected deployment record matching this task and a reason are required');
       nextState = 'REVIEW';
-      eventType = 'APPROVAL_REJECTED';
-      payload = { approvalId: transition.approvalId, reason: transition.reason };
+      eventType = 'DEPLOYMENT_REJECTED';
+      payload = { approvalId: transition.approvalId, taskId: task.id, reason: transition.reason };
+      break;
+    case 'DEPLOYMENT_RESULT_RECORDED':
+      if (!isDeployment || transition.evidenceIds.length === 0 || transition.evidenceIds.some((evidenceId) => !nonEmpty(evidenceId))) {
+        invalid(task, transition, 'verified deployment result requires evidence');
+      }
+      nextState = 'COMPLETED';
+      eventType = 'DEPLOYMENT_RESULT_RECORDED';
+      payload = { taskId: task.id, evidenceIds: [...transition.evidenceIds] };
       break;
   }
 

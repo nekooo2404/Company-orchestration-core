@@ -191,10 +191,38 @@ describe('transitionTask', () => {
       approvalId: approvalId('approval-1'), subjectType: 'DEPLOYMENT' as const, subjectId: deployment.id,
       reason: 'Release', requestedBy: context.actor, correlationId: deployment.traceId,
       causationId: eventId('request-approval'), version: 0, createdAt: now, updatedAt: now,
-      state: 'PENDING' as const, decision: null, decidedBy: null, decidedAt: null
+      state: 'PENDING' as const, decision: null, decisionReason: null, decidedBy: null, decidedAt: null
     };
     expect(() => transitionTask(deployment, { type: 'DEPLOYMENT_APPROVED', approvalId: pendingApproval.approvalId, approvalRecord: pendingApproval }, { ...context, isDeployment: true }))
       .toThrow(/approved deployment record/i);
+  });
+
+  it('keeps an approved deployment executing until a verified result is recorded', () => {
+    const deployment = makeTask({ state: 'WAITING_FOR_APPROVAL', isDeployment: true });
+    const approved = {
+      approvalId: approvalId('approval-1'), subjectType: 'DEPLOYMENT' as const, subjectId: deployment.id,
+      reason: 'Release staging', requestedBy: context.actor, correlationId: deployment.traceId,
+      causationId: eventId('request-approval'), version: 1, createdAt: now, updatedAt: now,
+      state: 'APPROVED' as const, decision: 'APPROVE' as const, decisionReason: 'Approved by CEO',
+      decidedBy: { kind: 'CEO' as const }, decidedAt: now
+    };
+    const executing = transitionTask(
+      deployment,
+      { type: 'DEPLOYMENT_APPROVED', approvalId: approved.approvalId, approvalRecord: approved },
+      { ...context, isDeployment: true }
+    );
+    expect(executing.task.state).toBe('RUNNING');
+    expect(executing.event.eventType).toBe('DEPLOYMENT_APPROVED');
+    expect(() => transitionTask(executing.task, { type: 'TASK_COMPLETED', evidenceIds: ['deploy-1'] }, { ...context, isDeployment: true }))
+      .toThrow(/verified deployment result/i);
+
+    const completed = transitionTask(
+      executing.task,
+      { type: 'DEPLOYMENT_RESULT_RECORDED', evidenceIds: ['deploy-1'] },
+      { ...context, isDeployment: true }
+    );
+    expect(completed.task.state).toBe('COMPLETED');
+    expect(completed.event.eventType).toBe('DEPLOYMENT_RESULT_RECORDED');
   });
 
   it('only escalates a recovering task after the fifth recovery cycle', () => {

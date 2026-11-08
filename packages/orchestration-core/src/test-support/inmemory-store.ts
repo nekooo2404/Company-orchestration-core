@@ -16,7 +16,8 @@ import {
   InvalidPersistenceOperationError,
   OptimisticConcurrencyError
 } from '../repository';
-import type { DispatchClaim, DispatchClaimRequest, DispatchClaimStore, EventStore, Outbox, OutboxCommand, SaveTaskAndAppendInput, TaskRepository, TransactionalPersistence } from '../ports';
+import type { DispatchClaim, DispatchClaimRequest, DispatchClaimStore, EventStore, Outbox, OutboxCommand, SaveApprovalDecisionAndTaskInput, SaveTaskAndAppendInput, TaskRepository, TransactionalPersistence } from '../ports';
+import type { InMemoryApprovalStore } from '../approvals';
 
 const clone = <T>(value: T): T => globalThis.structuredClone(value);
 
@@ -173,6 +174,17 @@ export class InMemoryEventStore implements EventStore {
   public async hasEvent(eventId: EventId): Promise<boolean> {
     return this.eventsById.has(EventIdSchema.parse(eventId));
   }
+
+  public snapshot(): { streams: Array<[string, DomainEvent[]]>; eventsById: Array<[string, DomainEvent]> } {
+    return clone({ streams: [...this.streams.entries()], eventsById: [...this.eventsById.entries()] });
+  }
+
+  public restore(snapshot: { streams: Array<[string, DomainEvent[]]>; eventsById: Array<[string, DomainEvent]> }): void {
+    this.streams.clear();
+    this.eventsById.clear();
+    for (const [aggregateId, events] of snapshot.streams) this.streams.set(aggregateId, clone(events));
+    for (const [eventId, event] of snapshot.eventsById) this.eventsById.set(eventId, clone(event));
+  }
 }
 
 export class InMemoryDispatchClaimStore implements DispatchClaimStore {
@@ -222,6 +234,11 @@ export class InMemoryTransactionalPersistence implements TransactionalPersistenc
 
   public saveTaskAndAppend(input: SaveTaskAndAppendInput): Promise<void> {
     return this.persistence.saveTaskAndAppend(input);
+  }
+
+  public async saveApprovalDecisionAndTask(input: SaveApprovalDecisionAndTaskInput): Promise<void> {
+    void input;
+    throw new InvalidPersistenceOperationError('Atomic approval persistence is not configured');
   }
 
   public claimDispatch(input: DispatchClaimRequest): Promise<DispatchClaim | null> {
@@ -361,6 +378,107 @@ export class InMemoryOutbox implements Outbox {
       ...command,
       completedAt: clone(this.now())
     });
+  }
+
+  public snapshot(): Map<string, OutboxCommand> {
+    return clone(this.commands);
+  }
+
+  public restore(snapshot: Map<string, OutboxCommand>): void {
+    this.commands.clear();
+    for (const [commandId, command] of snapshot.entries()) this.commands.set(commandId, clone(command));
+  }
+}
+
+export type InMemoryApprovalFailurePoint =
+  | 'after-approval'
+  | 'after-task'
+  | 'after-approval-event'
+  | 'after-task-event'
+  | 'after-outbox';
+
+export interface InMemoryApprovalTransactionalPersistenceOptions {
+  tasks: InMemoryTaskRepository;
+  events: InMemoryEventStore;
+  outbox: InMemoryOutbox;
+  approvals: InMemoryApprovalStore;
+  claims?: DispatchClaimStore;
+  failAfter?: InMemoryApprovalFailurePoint;
+}
+
+export class InMemoryApprovalTransactionalPersistence implements TransactionalPersistence {
+  private readonly claims: DispatchClaimStore;
+  private readonly operations = new Map<string, string>();
+
+  public constructor(private readonly options: InMemoryApprovalTransactionalPersistenceOptions) {
+    this.claims = options.claims ?? new InMemoryDispatchClaimStore(options.tasks);
+  }
+
+  public async saveTaskAndAppend(input: SaveTaskAndAppendInput): Promise<void> {
+    await this.options.tasks.save(input.task, input.expectedVersion);
+    await this.options.events.append(input.events, input.expectedVersion);
+    for (const command of input.commands) await this.options.outbox.enqueue(command);
+  }
+
+  public async saveApprovalDecisionAndTask(input: SaveApprovalDecisionAndTaskInput): Promise<void> {
+    const priorFingerprint = this.operations.get(input.idempotencyKey);
+    if (priorFingerprint !== undefined) {
+      if (priorFingerprint !== input.requestFingerprint) {
+        throw new InvalidPersistenceOperationError('Atomic approval idempotency key was reused with different data');
+      }
+      return;
+    }
+    const taskProvided = input.task !== undefined || input.taskEvent !== undefined || input.expectedTaskVersion !== undefined;
+    if (taskProvided !== (input.task !== undefined && input.taskEvent !== undefined && input.expectedTaskVersion !== undefined)) {
+      throw new InvalidPersistenceOperationError('Atomic approval task fields must be provided together');
+    }
+
+    const approvalSnapshot = this.options.approvals.snapshot();
+    const eventSnapshot = this.options.events.snapshot();
+    const outboxSnapshot = this.options.outbox.snapshot();
+    const taskSnapshot = input.task === undefined ? null : this.options.tasks.snapshot(input.task.id);
+    try {
+      await this.options.approvals.commitDecision(
+        input.approval,
+        input.expectedApprovalVersion,
+        input.approvalEvent,
+        input.idempotencyKey,
+        input.requestFingerprint
+      );
+      this.failIf('after-approval');
+
+      if (input.task !== undefined && input.taskEvent !== undefined && input.expectedTaskVersion !== undefined) {
+        await this.options.tasks.save(input.task, input.expectedTaskVersion);
+        this.failIf('after-task');
+      }
+      await this.options.events.append([input.approvalEvent], input.expectedApprovalVersion);
+      this.failIf('after-approval-event');
+      if (input.taskEvent !== undefined && input.expectedTaskVersion !== undefined) {
+        await this.options.events.append([input.taskEvent], input.expectedTaskVersion);
+        this.failIf('after-task-event');
+      }
+      for (const command of input.commands) await this.options.outbox.enqueue(command);
+      this.failIf('after-outbox');
+      this.operations.set(input.idempotencyKey, input.requestFingerprint);
+    } catch (error) {
+      this.options.approvals.restore(approvalSnapshot);
+      this.options.events.restore(eventSnapshot);
+      this.options.outbox.restore(outboxSnapshot);
+      if (input.task !== undefined) this.options.tasks.restore(input.task.id, taskSnapshot);
+      throw error;
+    }
+  }
+
+  public claimDispatch(input: DispatchClaimRequest): Promise<DispatchClaim | null> {
+    return this.claims.claimDispatch(input);
+  }
+
+  public releaseDispatch(taskId: TaskId, workerId: string, leaseId: string): Promise<boolean> {
+    return this.claims.releaseDispatch(taskId, workerId, leaseId);
+  }
+
+  private failIf(point: InMemoryApprovalFailurePoint): void {
+    if (this.options.failAfter === point) throw new Error(`Injected atomic approval failure at ${point}`);
   }
 }
 

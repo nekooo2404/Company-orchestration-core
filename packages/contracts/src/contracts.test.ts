@@ -55,6 +55,7 @@ const validApproval = {
   causationId: eventId('event-1'),
   state: 'PENDING',
   decision: null,
+  decisionReason: null,
   decidedBy: null,
   decidedAt: null,
   version: 0,
@@ -220,6 +221,9 @@ describe('shared orchestration contracts', () => {
       'RECOVERY_STARTED',
       'TASK_COMPLETED',
       'DEPLOYMENT_APPROVAL_REQUESTED',
+      'DEPLOYMENT_APPROVED',
+      'DEPLOYMENT_REJECTED',
+      'DEPLOYMENT_RESULT_RECORDED',
       'APPROVAL_REQUESTED',
       'TASK_ESCALATED',
       'TASK_CANCELLED',
@@ -357,6 +361,7 @@ describe('shared orchestration contracts', () => {
         ...validApproval,
         state: 'APPROVED',
         decision: 'APPROVE',
+        decisionReason: 'approved for staging',
         decidedBy: { kind: 'CEO' },
         decidedAt: now
       }).success
@@ -366,6 +371,7 @@ describe('shared orchestration contracts', () => {
         ...validApproval,
         state: 'REJECTED',
         decision: 'REJECT',
+        decisionReason: 'missing rollback plan',
         decidedBy: { kind: 'CEO' },
         decidedAt: now
       }).success
@@ -393,6 +399,7 @@ describe('shared orchestration contracts', () => {
         ...validApproval,
         state: 'EXPIRED',
         decision: null,
+        decisionReason: null,
         decidedBy: { kind: 'SYSTEM', name: 'approval-expirer' },
         decidedAt: now
       }).success
@@ -402,6 +409,7 @@ describe('shared orchestration contracts', () => {
         ...validApproval,
         state: 'CANCELLED',
         decision: null,
+        decisionReason: null,
         decidedBy: { kind: 'CEO' },
         decidedAt: now
       }).success
