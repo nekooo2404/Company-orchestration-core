@@ -64,6 +64,7 @@ export class InMemoryDomainEventPublisher implements DomainEventPublisher {
 export interface CommunicationOptions {
   newMessageId: () => string;
   reader: () => ActorRef;
+  eventScopeResolver?: (event: DomainEvent) => ChannelScope;
   now?: () => Date;
 }
 
@@ -128,7 +129,13 @@ export class InMemoryCommunicationService implements CommunicationService {
   }
 
   public async publishEvent(event: DomainEvent): Promise<void> {
-    await this.eventPublisher.publish(event);
+    const parsed = DomainEventSchema.parse(event);
+    const scope = parsed.aggregateType === 'TASK'
+      ? { kind: 'task' as const, taskId: TaskIdSchema.parse(parsed.aggregateId) }
+      : this.options.eventScopeResolver?.(parsed);
+    if (!scope) throw new Error(`An event scope resolver is required for ${parsed.aggregateType} events`);
+    await this.authorization.authorizeWrite(parsed.actor, scope);
+    await this.eventPublisher.publish(parsed);
   }
 
   public async listMessages(scope: ChannelScope, after?: string): Promise<Message[]> {
