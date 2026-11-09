@@ -14,6 +14,8 @@ Mode: local single-CEO
 - Task transitioned `PENDING -> RUNNING -> COMPLETED`.
 - Mission telemetry transitioned `PENDING -> COMPLETED` after mission upsert fix.
 - Mission Grid build passed and local HTTP returned `200`.
+- Model routing screen persisted Ollama endpoint `default` in PostgreSQL.
+- `apps/local-worker` ran against Ollama `deepseek-coder:33b`; one task completed through model response and Docker sandbox evidence.
 - Full local suite: 175 passed, 10 PostgreSQL tests skipped when Docker is disabled in test runner.
 
 ## Local Commands
@@ -32,6 +34,6 @@ Model configuration can be saved in Mission Grid `Model routing` or through `PUT
 
 ## Remaining Gates
 
-- Worker currently executes one local project and one configured agent profile.
+- Worker currently executes one local project and one configured agent profile; expand agent registry and capacity policy before multi-agent load testing.
 - Mission store is durable; task/session lifecycle still needs full production worker orchestration and durable lifecycle transaction integration.
 - OpenTelemetry exporters, security scan, chaos suite, rollback runner, and 50-agent load test remain release gates.
