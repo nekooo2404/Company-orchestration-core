@@ -57,7 +57,10 @@ export class PostgresMissionStore implements MissionStore {
           return;
         }
       }
-      await client.query(`INSERT INTO missions (mission_id, project_id, title, brief, workflow_id, status, tasks, idempotency_key, request_fingerprint, created_at, updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`, [mission.missionId, mission.projectId, mission.title, mission.brief, mission.workflowId, mission.status, JSON.stringify(mission.tasks), metadata?.idempotencyKey ?? null, metadata?.requestFingerprint ?? null, mission.createdAt, mission.updatedAt]);
+      await client.query(`INSERT INTO missions (mission_id, project_id, title, brief, workflow_id, status, tasks, idempotency_key, request_fingerprint, created_at, updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+        ON CONFLICT (mission_id) DO UPDATE SET project_id=EXCLUDED.project_id, title=EXCLUDED.title,
+          brief=EXCLUDED.brief, workflow_id=EXCLUDED.workflow_id, status=EXCLUDED.status,
+          tasks=EXCLUDED.tasks, updated_at=EXCLUDED.updated_at`, [mission.missionId, mission.projectId, mission.title, mission.brief, mission.workflowId, mission.status, JSON.stringify(mission.tasks), metadata?.idempotencyKey ?? null, metadata?.requestFingerprint ?? null, mission.createdAt, mission.updatedAt]);
       await client.query('COMMIT');
     } catch (error) { await client.query('ROLLBACK').catch(() => undefined); throw error; }
     finally { client.release(); }

@@ -32,6 +32,8 @@
 - [ ] Implement parameterized PostgreSQL mission persistence.
 - [ ] Run control-plane tests.
 
+Status: completed. PostgreSQL mission upsert/idempotency and model endpoint persistence are implemented; live mission smoke passed.
+
 ### Task 2: Local Server Wiring
 
 **Files:**
@@ -44,6 +46,8 @@
 - [ ] Fail closed when production mode has no database URL.
 - [ ] Verify root, health, submit, list, and status endpoints.
 
+Status: completed. Server applies migration in PostgreSQL mode and exposes model endpoint configuration.
+
 ### Task 3: Runtime Execution
 
 **Files:**
@@ -55,6 +59,8 @@
 - [ ] Route model calls through `OpenAICompatibleGateway`.
 - [ ] Route commands through `DockerToolRunner`.
 - [ ] Persist task/session/checkpoint transitions.
+
+Status: completed for local Ollama + Docker path. Worker consumes PostgreSQL mission tasks, calls `OpenAICompatibleGateway`, runs `DockerToolRunner`, and persists completion/recovery state.
 
 ### Task 4: Production Safety Gate
 

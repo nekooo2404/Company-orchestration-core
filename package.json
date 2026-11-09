@@ -4,6 +4,7 @@
   "scripts": {
     "build": "tsc -b",
     "control-plane:dev": "corepack pnpm build && node apps/control-plane-server/server.mjs",
+    "worker:dev": "corepack pnpm build && node apps/local-worker/worker.mjs",
     "ceo": "node apps/ceo-cli/cli.mjs",
     "test": "vitest run",
     "test:watch": "vitest",

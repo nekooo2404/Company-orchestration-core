@@ -21,6 +21,23 @@ CREATE TABLE IF NOT EXISTS missions (
 CREATE INDEX IF NOT EXISTS missions_project_updated
   ON missions (project_id, updated_at DESC);
 
+CREATE TABLE IF NOT EXISTS model_endpoints (
+  endpoint_id text PRIMARY KEY,
+  provider text NOT NULL,
+  base_url text NOT NULL,
+  model text NOT NULL,
+  credential_ref text NOT NULL,
+  headers jsonb,
+  timeout_ms integer NOT NULL,
+  max_retries integer NOT NULL,
+  circuit_failure_threshold integer NOT NULL,
+  circuit_reset_ms integer NOT NULL,
+  input_cost_per_million_tokens double precision,
+  output_cost_per_million_tokens double precision,
+  allow_insecure_local_http boolean NOT NULL DEFAULT false,
+  updated_at timestamptz NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS tasks (
   task_id text PRIMARY KEY,
   workflow_id text NOT NULL,

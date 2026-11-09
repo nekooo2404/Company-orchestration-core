@@ -1,6 +1,7 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { agentSessionId, type ActorRef } from '@aicompany/contracts';
 import type { ControlPlaneService } from './service.js';
+import { InMemoryModelEndpointStore, type ModelEndpointInput, type ModelEndpointStore } from './model-endpoints.js';
 
 const actorFrom = (request: IncomingMessage): ActorRef => {
   const value = request.headers['x-aicompany-actor'];
@@ -21,7 +22,7 @@ const send = (response: ServerResponse, status: number, value: unknown): void =>
 
 export const parseActor = actorFrom;
 
-export const createControlPlaneServer = (service: ControlPlaneService): Server => createServer(async (request, response) => {
+export const createControlPlaneServer = (service: ControlPlaneService, modelEndpoints: ModelEndpointStore = new InMemoryModelEndpointStore()): Server => createServer(async (request, response) => {
   try {
     if (request.method === 'GET' && request.url === '/health') return send(response, 200, { status: 'ok' });
     if (request.method === 'GET' && request.url === '/') return send(response, 200, {
@@ -32,6 +33,17 @@ export const createControlPlaneServer = (service: ControlPlaneService): Server =
       actorHeader: 'x-aicompany-actor: CEO'
     });
     const actor = actorFrom(request);
+    if (request.method === 'GET' && request.url === '/v1/model-endpoints') {
+      if (actor.kind !== 'CEO') return send(response, 403, { error: 'Only CEO may view model endpoints' });
+      return send(response, 200, await modelEndpoints.list());
+    }
+    const endpointMatch = request.url?.match(/^\/v1\/model-endpoints\/([^/]+)$/);
+    if (request.method === 'PUT' && endpointMatch) {
+      if (actor.kind !== 'CEO') return send(response, 403, { error: 'Only CEO may configure model endpoints' });
+      const input = await body(request);
+      await modelEndpoints.save({ ...input, id: decodeURIComponent(endpointMatch[1]) } as ModelEndpointInput);
+      return send(response, 200, await modelEndpoints.get(decodeURIComponent(endpointMatch[1])));
+    }
     if (request.method === 'POST' && request.url === '/v1/missions') { const input = await body(request); return send(response, 201, await service.submit({ ...input, requestedBy: actor } as never)); }
     if (request.method === 'GET' && request.url?.startsWith('/v1/missions?')) { const projectId = new URL(request.url, 'http://control-plane').searchParams.get('projectId'); if (!projectId) return send(response, 400, { error: 'projectId is required' }); return send(response, 200, await service.list(projectId, actor)); }
     const missionMatch = request.url?.match(/^\/v1\/missions\/([^/]+)$/);

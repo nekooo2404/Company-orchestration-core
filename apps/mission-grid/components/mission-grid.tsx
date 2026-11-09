@@ -2,12 +2,13 @@
 
 import { useEffect, useMemo, useState } from 'react';
 import type { ReactNode } from 'react';
-import { Activity, AlertTriangle, CheckCircle2, ChevronRight, Clock3, Command, Cpu, GitBranch, LayoutGrid, MessageSquare, Search, ShieldCheck, Terminal, Workflow } from 'lucide-react';
+import { Activity, AlertTriangle, ArrowLeft, CheckCircle2, ChevronRight, Clock3, Command, Cpu, GitBranch, LayoutGrid, MessageSquare, Save, Search, Settings, ShieldCheck, Terminal, Workflow } from 'lucide-react';
 import { KiboStatus } from '../ui/kibo-ui';
 
 type Status = 'RUNNING' | 'QUEUED' | 'RECOVERING' | 'APPROVAL' | 'COMPLETED';
 type Mission = { id: string; title: string; project: string; status: Status; progress: number; agents: number; tasks: number; cost: string; updated: string; lead: string; signal: string };
 type ApiMission = { missionId: string; title: string; projectId: string; status: string; tasks: Array<{ state: string; ownerAgentDefinitionId: string | null }>; updatedAt: string };
+type ModelEndpoint = { id: string; provider: string; baseUrl: string; model: string; credentialRef: string; timeoutMs: number; maxRetries: number; circuitFailureThreshold: number; circuitResetMs: number; allowInsecureLocalHttp?: boolean };
 
 const apiBaseUrl = process.env.NEXT_PUBLIC_CONTROL_PLANE_URL ?? 'http://127.0.0.1:4000';
 const projectId = process.env.NEXT_PUBLIC_CONTROL_PLANE_PROJECT_ID ?? 'aicompany';
@@ -33,6 +34,11 @@ export function MissionGrid() {
   const [query, setQuery] = useState('');
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [view, setView] = useState<'missions' | 'models'>('missions');
+  const [modelEndpoints, setModelEndpoints] = useState<ModelEndpoint[]>([]);
+  const [modelForm, setModelForm] = useState<ModelEndpoint>({ id: 'default', provider: 'openai-compatible', baseUrl: '', model: '', credentialRef: 'env:MODEL_API_KEY', timeoutMs: 120000, maxRetries: 2, circuitFailureThreshold: 3, circuitResetMs: 30000, allowInsecureLocalHttp: false });
+  const [modelSaving, setModelSaving] = useState(false);
+  const [modelError, setModelError] = useState<string | null>(null);
   useEffect(() => {
     let active = true;
     const load = async () => {
@@ -47,15 +53,40 @@ export function MissionGrid() {
     void load(); const timer = setInterval(() => void load(), 2000);
     return () => { active = false; clearInterval(timer); };
   }, []);
+  useEffect(() => {
+    let active = true;
+    const load = async () => {
+      try {
+        const response = await fetch(`${apiBaseUrl}/v1/model-endpoints`, { headers: { 'x-aicompany-actor': 'CEO' }, cache: 'no-store' });
+        if (!response.ok) throw new Error(`Control Plane HTTP ${response.status}`);
+        const data = await response.json() as ModelEndpoint[];
+        if (active && data.length > 0) { setModelEndpoints(data); setModelForm(data[0]); }
+      } catch (cause) { if (active) setModelError(cause instanceof Error ? cause.message : 'Model endpoint unavailable'); }
+    };
+    void load();
+    return () => { active = false; };
+  }, []);
+  const saveModel = async () => {
+    setModelSaving(true); setModelError(null);
+    try {
+      const response = await fetch(`${apiBaseUrl}/v1/model-endpoints/${encodeURIComponent(modelForm.id)}`, { method: 'PUT', headers: { 'content-type': 'application/json', 'x-aicompany-actor': 'CEO' }, body: JSON.stringify(modelForm) });
+      if (!response.ok) throw new Error(`Control Plane HTTP ${response.status}`);
+      const saved = await response.json() as ModelEndpoint;
+      setModelEndpoints((current) => [...current.filter((item) => item.id !== saved.id), saved]); setModelForm(saved);
+    } catch (cause) { setModelError(cause instanceof Error ? cause.message : 'Model endpoint save failed'); }
+    finally { setModelSaving(false); }
+  };
   const selected = missions.find((mission) => mission.id === selectedId) ?? null;
   const visible = useMemo(() => missions.filter((mission) => (filter === 'ALL' || mission.status === filter) && `${mission.title} ${mission.project}`.toLowerCase().includes(query.toLowerCase())), [filter, query]);
   const counts = { active: missions.filter((mission) => mission.status === 'RUNNING').length, queued: missions.filter((mission) => mission.status === 'QUEUED').length, recovery: missions.filter((mission) => mission.status === 'RECOVERING').length, approval: missions.filter((mission) => mission.status === 'APPROVAL').length };
+
+  if (view === 'models') return <ModelSettingsScreen form={modelForm} endpoints={modelEndpoints} error={modelError} saving={modelSaving} onBack={() => setView('missions')} onChange={setModelForm} onSelect={(id) => { const selected = modelEndpoints.find((item) => item.id === id); if (selected) setModelForm(selected); }} onSave={saveModel} />;
 
   return <main className="signal-grid min-h-screen overflow-hidden">
     <header className="border-b border-white/10 bg-graphite-950/90 px-5 py-4 backdrop-blur md:px-8">
       <div className="mx-auto flex max-w-[1680px] items-center justify-between gap-4">
         <div className="flex items-center gap-4"><div className="flex h-9 w-9 items-center justify-center rounded-md border border-signal-lime/40 bg-signal-lime/10 text-signal-lime"><Command size={18} /></div><div><div className="text-sm font-bold tracking-[.22em] text-white">MISSION GRID</div><div className="mt-1 text-[10px] uppercase tracking-[.16em] text-white/40">Graphite Signal / Control room</div></div></div>
-        <div className="hidden items-center gap-5 text-[10px] uppercase tracking-[.16em] text-white/45 md:flex"><span className="flex items-center gap-2"><span className="h-2 w-2 rounded-full bg-signal-lime shadow-[0_0_12px_#b8ff5a]" />System nominal</span><span>09 Nov 2026 / 01:48 ICT</span><div className="h-5 w-px bg-white/10" /><span className="text-signal-lime">CEO / ONLINE</span></div>
+        <div className="flex items-center gap-4 text-[10px] uppercase tracking-[.16em] text-white/45"><span className="hidden items-center gap-2 md:flex"><span className="h-2 w-2 rounded-full bg-signal-lime shadow-[0_0_12px_#b8ff5a]" />System nominal</span><button aria-label="Open model routing" onClick={() => setView('models')} className="inline-flex items-center gap-2 rounded-md border border-white/10 px-3 py-2 text-[10px] text-white/60 transition hover:border-signal-lime/50 hover:text-signal-lime"><Settings size={14} />Model routing</button><span className="hidden text-signal-lime md:inline">CEO / ONLINE</span></div>
       </div>
     </header>
     <section className="mx-auto max-w-[1680px] px-5 py-6 md:px-8">
@@ -80,3 +111,10 @@ function MissionInspector({ mission }: { mission: Mission | null }) {
 }
 
 function InspectorStat({ label, value }: { label: string; value: string }) { return <div className="rounded-md border border-white/[.08] bg-black/10 p-3"><div className="text-[10px] uppercase tracking-[.13em] text-white/30">{label}</div><div className="mt-2 text-sm font-bold text-white/80">{value}</div></div>; }
+
+function ModelSettingsScreen({ form, endpoints, error, saving, onBack, onChange, onSelect, onSave }: { form: ModelEndpoint; endpoints: ModelEndpoint[]; error: string | null; saving: boolean; onBack: () => void; onChange: (value: ModelEndpoint) => void; onSelect: (id: string) => void; onSave: () => Promise<void> }) {
+  const update = <K extends keyof ModelEndpoint>(key: K, value: ModelEndpoint[K]) => onChange({ ...form, [key]: value });
+  return <main className="signal-grid min-h-screen overflow-hidden"><header className="border-b border-white/10 bg-graphite-950/90 px-5 py-4 backdrop-blur md:px-8"><div className="mx-auto flex max-w-[1680px] items-center justify-between gap-4"><div className="flex items-center gap-4"><button aria-label="Back to mission telemetry" onClick={onBack} className="rounded-md border border-white/10 p-2 text-white/60 hover:border-signal-lime/50 hover:text-signal-lime"><ArrowLeft size={16} /></button><div><div className="text-sm font-bold tracking-[.22em] text-white">MODEL ROUTING</div><div className="mt-1 text-[10px] uppercase tracking-[.16em] text-white/40">CEO configuration / local runtime</div></div></div><div className="flex items-center gap-2 text-[10px] uppercase tracking-[.14em] text-white/35"><Settings size={14} className="text-signal-lime" />Changes affect next worker start</div></div></header><section className="mx-auto max-w-[1100px] px-5 py-8 md:px-8"><div className="mb-8"><div className="mb-3 text-[10px] uppercase tracking-[.2em] text-signal-lime">Provider connection</div><h1 className="text-3xl font-bold tracking-[-.04em] text-white">Assign base URL and model</h1><p className="mt-3 max-w-2xl text-sm leading-6 text-white/45">Store endpoint metadata and a credential reference. Raw API keys never enter dashboard state or PostgreSQL.</p></div><div className="grid gap-5 lg:grid-cols-[260px_1fr]"><aside className="rounded-lg border border-white/10 bg-graphite-900/85 p-4"><div className="mb-3 text-[10px] uppercase tracking-[.16em] text-white/35">Endpoints</div><div className="space-y-2">{endpoints.map((endpoint) => <button key={endpoint.id} onClick={() => onSelect(endpoint.id)} className={`flex w-full items-center justify-between rounded-md border px-3 py-3 text-left text-xs ${form.id === endpoint.id ? 'border-signal-lime/50 bg-signal-lime/10 text-signal-lime' : 'border-white/10 text-white/55 hover:bg-white/[.04]'}`}><span>{endpoint.id}</span><span className="text-[10px]">{endpoint.model}</span></button>)}{endpoints.length === 0 && <div className="text-xs leading-5 text-white/35">No saved endpoint. Fill form to create `default`.</div>}</div></aside><form className="rounded-lg border border-white/10 bg-graphite-900/85 p-5" onSubmit={(event) => { event.preventDefault(); void onSave(); }}><div className="grid gap-5 md:grid-cols-2"><Field label="Endpoint ID"><input value={form.id} onChange={(event) => update('id', event.target.value)} placeholder="default" /></Field><Field label="Provider"><input value={form.provider} onChange={(event) => update('provider', event.target.value)} placeholder="openai-compatible" /></Field><Field label="Base URL" wide><input value={form.baseUrl} onChange={(event) => update('baseUrl', event.target.value)} placeholder="https://api.openai.com/v1" /></Field><Field label="Model" wide><input value={form.model} onChange={(event) => update('model', event.target.value)} placeholder="gpt-4.1-mini" /></Field><Field label="Credential reference" wide><input value={form.credentialRef} onChange={(event) => update('credentialRef', event.target.value)} placeholder="env:MODEL_API_KEY" /><span className="mt-2 block text-[10px] text-white/30">Example: `env:MODEL_API_KEY` or `vault://model/default`.</span></Field><Field label="Timeout (ms)"><input type="number" min={1000} value={form.timeoutMs} onChange={(event) => update('timeoutMs', Number(event.target.value))} /></Field><Field label="Max retries"><input type="number" min={0} max={10} value={form.maxRetries} onChange={(event) => update('maxRetries', Number(event.target.value))} /></Field></div>{error && <div role="alert" className="mt-5 rounded-md border border-signal-rose/30 bg-signal-rose/10 p-3 text-xs text-signal-rose">{error}</div>}<div className="mt-6 flex justify-end"><button type="submit" disabled={saving} className="inline-flex items-center gap-2 rounded-md border border-signal-lime/40 bg-signal-lime/10 px-4 py-2 text-xs font-bold uppercase tracking-[.12em] text-signal-lime hover:bg-signal-lime/20 disabled:opacity-40"><Save size={14} />{saving ? 'Saving...' : 'Save endpoint'}</button></div></form></div></section></main>;
+}
+
+function Field({ label, wide, children }: { label: string; wide?: boolean; children: ReactNode }) { return <label className={`flex flex-col text-[10px] uppercase tracking-[.14em] text-white/40 ${wide ? 'md:col-span-2' : ''}`}>{label}<div className="mt-2">{children}</div></label>; }

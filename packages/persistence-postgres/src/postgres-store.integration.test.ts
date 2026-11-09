@@ -227,7 +227,9 @@ integration('PostgreSQL persistence', () => {
     };
     await missions.save(mission, { idempotencyKey: 'mission-key', requestFingerprint: 'fingerprint-1' });
     await missions.save(mission, { idempotencyKey: 'mission-key', requestFingerprint: 'fingerprint-1' });
+    await missions.save({ ...mission, status: 'COMPLETED', updatedAt: new Date(now.getTime() + 1000) });
     await expect(missions.findByIdempotencyKey('mission-key')).resolves.toMatchObject({ fingerprint: 'fingerprint-1', mission: { missionId: 'mission-1' } });
+    await expect(missions.get('mission-1')).resolves.toMatchObject({ status: 'COMPLETED' });
     await expect(missions.list('project-1')).resolves.toHaveLength(1);
   });
 
