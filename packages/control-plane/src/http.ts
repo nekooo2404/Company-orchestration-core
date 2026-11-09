@@ -19,6 +19,8 @@ const body = async (request: IncomingMessage): Promise<Record<string, unknown>> 
 
 const send = (response: ServerResponse, status: number, value: unknown): void => { response.statusCode = status; response.setHeader('content-type', 'application/json'); response.end(JSON.stringify(value)); };
 
+export const parseActor = actorFrom;
+
 export const createControlPlaneServer = (service: ControlPlaneService): Server => createServer(async (request, response) => {
   try {
     if (request.method === 'GET' && request.url === '/health') return send(response, 200, { status: 'ok' });

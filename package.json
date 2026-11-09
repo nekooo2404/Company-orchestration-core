@@ -3,6 +3,8 @@
   "private": true,
   "scripts": {
     "build": "tsc -b",
+    "control-plane:dev": "pnpm build && node apps/control-plane-server/server.mjs",
+    "ceo": "node apps/ceo-cli/cli.mjs",
     "test": "vitest run",
     "test:watch": "vitest",
     "typecheck": "tsc -b",
