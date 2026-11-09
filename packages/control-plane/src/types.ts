@@ -26,7 +26,8 @@ export interface MissionPlanner {
 }
 
 export interface MissionStore {
-  save(mission: Mission): Promise<void>;
+  save(mission: Mission, metadata?: { idempotencyKey?: string; requestFingerprint?: string }): Promise<void>;
+  findByIdempotencyKey(idempotencyKey: string): Promise<{ fingerprint: string; mission: Mission } | null>;
   get(missionId: string): Promise<Mission | null>;
   list(projectId: string): Promise<Mission[]>;
 }

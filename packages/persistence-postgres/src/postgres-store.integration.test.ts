@@ -20,6 +20,7 @@ import type {
   TaskRepository,
   TransactionalPersistence
 } from '@aicompany/orchestration-core';
+import type { Mission, MissionStore } from '@aicompany/control-plane';
 import * as persistence from './index';
 
 type PostgresStoreContract = EventStore & TransactionalPersistence & {
@@ -33,6 +34,7 @@ type PostgresOutboxContract = {
 };
 
 type PersistenceModule = {
+  PostgresMissionStore: new (pool: Pool) => MissionStore;
   PostgresStore: new (pool: Pool) => PostgresStoreContract;
   PostgresRecoveryRecordStore: new (pool: Pool) => RecoveryRecordStore;
   PostgresTaskRepository: new (pool: Pool) => TaskRepository;
@@ -114,6 +116,7 @@ integration('PostgreSQL persistence', () => {
   let recoveryRecords: RecoveryRecordStore;
   let tasks: TaskRepository;
   let outbox: PostgresOutboxContract;
+  let missions: MissionStore;
   let container: { stop(): Promise<unknown> } | undefined;
 
   beforeAll(async () => {
@@ -142,6 +145,7 @@ integration('PostgreSQL persistence', () => {
     const migrationPath = fileURLToPath(new URL('../migrations/001_orchestration.sql', import.meta.url));
     await pool.query(await readFile(migrationPath, 'utf8'));
     store = new moduleExports.PostgresStore(pool);
+    missions = new moduleExports.PostgresMissionStore(pool);
     recoveryRecords = new moduleExports.PostgresRecoveryRecordStore(pool);
     tasks = new moduleExports.PostgresTaskRepository(pool);
     outbox = new moduleExports.PostgresOutbox(pool, { leaseDurationMs: 60_000 });
@@ -154,7 +158,7 @@ integration('PostgreSQL persistence', () => {
 
   beforeEach(async () => {
     await pool.query(
-      'TRUNCATE TABLE recovery_records, approvals, agent_sessions, domain_events, outbox_commands, tasks, workflows RESTART IDENTITY CASCADE'
+      'TRUNCATE TABLE missions, recovery_records, approvals, agent_checkpoints, agent_sessions, domain_events, outbox_commands, tasks, workflows RESTART IDENTITY CASCADE'
     );
   });
 
@@ -214,6 +218,17 @@ integration('PostgreSQL persistence', () => {
     })).resolves.toEqual(approval);
     expect(await store.readStream(approval.approvalId)).toEqual([requestEvent]);
     expect((await outbox.claim(10, 'approval-replay')).map(({ commandId }) => commandId)).toEqual([command.commandId]);
+  });
+
+  it('persists mission idempotency across store instances', async () => {
+    const mission: Mission = {
+      missionId: 'mission-1', projectId: 'project-1', title: 'Mission', brief: 'Build API',
+      workflowId: workflowId('workflow-1'), tasks: [makeTask()], status: 'PENDING', createdAt: now, updatedAt: now
+    };
+    await missions.save(mission, { idempotencyKey: 'mission-key', requestFingerprint: 'fingerprint-1' });
+    await missions.save(mission, { idempotencyKey: 'mission-key', requestFingerprint: 'fingerprint-1' });
+    await expect(missions.findByIdempotencyKey('mission-key')).resolves.toMatchObject({ fingerprint: 'fingerprint-1', mission: { missionId: 'mission-1' } });
+    await expect(missions.list('project-1')).resolves.toHaveLength(1);
   });
 
   it('commits and replays a recovery record with its task event and command atomically', async () => {

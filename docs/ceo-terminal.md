@@ -8,7 +8,19 @@ CEO owns mission commands in the terminal. Mission Grid is read-only telemetry.
 corepack pnpm control-plane:dev
 ```
 
-Control Plane listens on `http://127.0.0.1:4000`.
+Without `DATABASE_URL`, Control Plane uses memory storage for development.
+Mission data disappears when server restarts.
+
+For restart-safe local production, set PostgreSQL mode first:
+
+```powershell
+$env:CONTROL_PLANE_STORAGE="postgres"
+$env:DATABASE_URL="postgresql://aicompany:aicompany_local_only@127.0.0.1:5432/aicompany"
+corepack pnpm control-plane:dev
+```
+
+The server applies `packages/persistence-postgres/migrations/001_orchestration.sql`
+before listening. Control Plane listens on `http://127.0.0.1:4000`.
 
 ## Submit mission
 

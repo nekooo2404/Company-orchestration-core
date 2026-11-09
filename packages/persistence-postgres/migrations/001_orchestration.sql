@@ -4,6 +4,23 @@ CREATE TABLE IF NOT EXISTS workflows (
   updated_at timestamptz NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS missions (
+  mission_id text PRIMARY KEY,
+  project_id text NOT NULL,
+  title text NOT NULL,
+  brief text NOT NULL,
+  workflow_id text NOT NULL,
+  status text NOT NULL,
+  tasks jsonb NOT NULL,
+  idempotency_key text UNIQUE,
+  request_fingerprint text,
+  created_at timestamptz NOT NULL,
+  updated_at timestamptz NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS missions_project_updated
+  ON missions (project_id, updated_at DESC);
+
 CREATE TABLE IF NOT EXISTS tasks (
   task_id text PRIMARY KEY,
   workflow_id text NOT NULL,

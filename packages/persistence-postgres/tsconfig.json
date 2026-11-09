@@ -8,6 +8,7 @@
   "include": ["src/**/*.ts"],
   "exclude": ["src/**/*.test.ts"],
   "references": [
+    { "path": "../control-plane" },
     { "path": "../contracts" },
     { "path": "../orchestration-core" }
   ]

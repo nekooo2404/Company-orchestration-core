@@ -21,6 +21,7 @@
   },
   "dependencies": {
     "@aicompany/contracts": "workspace:*",
+    "@aicompany/control-plane": "workspace:*",
     "@aicompany/orchestration-core": "workspace:*",
     "pg": "^8.23.1"
   },

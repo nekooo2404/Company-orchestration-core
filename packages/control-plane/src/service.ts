@@ -5,7 +5,19 @@ const clone = <T>(value: T): T => structuredClone(value);
 
 export class InMemoryMissionStore implements MissionStore {
   private readonly missions = new Map<string, Mission>();
-  public async save(mission: Mission): Promise<void> { this.missions.set(mission.missionId, clone(mission)); }
+  private readonly idempotency = new Map<string, { fingerprint: string; mission: Mission }>();
+  public async save(mission: Mission, metadata?: { idempotencyKey?: string; requestFingerprint?: string }): Promise<void> {
+    if (metadata?.idempotencyKey && metadata.requestFingerprint) {
+      const prior = this.idempotency.get(metadata.idempotencyKey);
+      if (prior && prior.fingerprint !== metadata.requestFingerprint) throw new Error('Mission idempotency key was reused with different input');
+      this.idempotency.set(metadata.idempotencyKey, { fingerprint: metadata.requestFingerprint, mission: clone(mission) });
+    }
+    this.missions.set(mission.missionId, clone(mission));
+  }
+  public async findByIdempotencyKey(idempotencyKey: string): Promise<{ fingerprint: string; mission: Mission } | null> {
+    const prior = this.idempotency.get(idempotencyKey);
+    return prior ? { fingerprint: prior.fingerprint, mission: clone(prior.mission) } : null;
+  }
   public async get(missionId: string): Promise<Mission | null> { const mission = this.missions.get(missionId); return mission ? clone(mission) : null; }
   public async list(projectId: string): Promise<Mission[]> { return [...this.missions.values()].filter((mission) => mission.projectId === projectId).sort((a, b) => b.updatedAt.getTime() - a.updatedAt.getTime()).map(clone); }
 }
@@ -29,7 +41,6 @@ export class HeuristicMissionPlanner implements MissionPlanner {
 }
 
 export class ControlPlaneService {
-  private readonly requests = new Map<string, { fingerprint: string; mission: Mission }>();
   private readonly commands = new Map<string, string>();
 
   public constructor(private readonly options: { planner: MissionPlanner; missions: MissionStore; authorization?: ControlPlaneAuthorization; commandHandler?: MissionCommandHandler; now?: () => Date; missionIdFactory?: (input: SolutionBriefInput) => string }) {}
@@ -40,12 +51,12 @@ export class ControlPlaneService {
     if (!title || !brief || !key) throw new Error('title, brief, and idempotencyKey are required');
     if (!(this.options.authorization ?? new DefaultControlPlaneAuthorization()).canSubmit(actor, input.projectId)) throw new Error('Only CEO may submit a solution brief');
     const fingerprint = JSON.stringify({ projectId: input.projectId, title, brief, actor, correlationId: input.correlationId });
-    const prior = this.requests.get(key);
+    const prior = await this.options.missions.findByIdempotencyKey(key);
     if (prior) { if (prior.fingerprint !== fingerprint) throw new Error('Mission idempotency key was reused with different input'); return clone(prior.mission); }
     const planned = await this.options.planner.plan({ ...input, requestedBy: actor, title, brief, idempotencyKey: key, correlationId: CorrelationIdSchema.parse(input.correlationId) });
     const now = this.options.now?.() ?? new Date();
     const mission: Mission = { missionId: this.options.missionIdFactory?.(input) ?? `mission:${input.projectId}:${key}`, projectId: input.projectId, title, brief, workflowId: planned.workflowId, tasks: planned.tasks, status: 'PENDING', createdAt: now, updatedAt: now };
-    await this.options.missions.save(mission); this.requests.set(key, { fingerprint, mission: clone(mission) }); return clone(mission);
+    await this.options.missions.save(mission, { idempotencyKey: key, requestFingerprint: fingerprint }); return clone(mission);
   }
 
   public async get(missionId: string, actor: SolutionBriefInput['requestedBy']): Promise<Mission> {
