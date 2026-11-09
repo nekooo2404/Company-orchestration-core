@@ -24,6 +24,13 @@ export const parseActor = actorFrom;
 export const createControlPlaneServer = (service: ControlPlaneService): Server => createServer(async (request, response) => {
   try {
     if (request.method === 'GET' && request.url === '/health') return send(response, 200, { status: 'ok' });
+    if (request.method === 'GET' && request.url === '/') return send(response, 200, {
+      service: 'AIcompany Control Plane',
+      mode: 'local-terminal-first',
+      dashboard: 'http://127.0.0.1:3000',
+      cli: 'corepack pnpm ceo mission --help',
+      actorHeader: 'x-aicompany-actor: CEO'
+    });
     const actor = actorFrom(request);
     if (request.method === 'POST' && request.url === '/v1/missions') { const input = await body(request); return send(response, 201, await service.submit({ ...input, requestedBy: actor } as never)); }
     if (request.method === 'GET' && request.url?.startsWith('/v1/missions?')) { const projectId = new URL(request.url, 'http://control-plane').searchParams.get('projectId'); if (!projectId) return send(response, 400, { error: 'projectId is required' }); return send(response, 200, await service.list(projectId, actor)); }

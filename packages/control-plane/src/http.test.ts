@@ -4,6 +4,21 @@ import { createControlPlaneServer } from './http';
 import { ControlPlaneService, HeuristicMissionPlanner, InMemoryMissionStore } from './service';
 
 describe('control plane HTTP', () => {
+  it('serves local root info without requiring an actor header', async () => {
+    const service = new ControlPlaneService({ planner: new HeuristicMissionPlanner(), missions: new InMemoryMissionStore() });
+    const server = createControlPlaneServer(service);
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()));
+    const address = server.address();
+    if (!address || typeof address === 'string') throw new Error('Test server did not bind');
+    try {
+      const response = await fetch(`http://127.0.0.1:${address.port}/`);
+      expect(response.status).toBe(200);
+      expect(await response.json()).toMatchObject({ mode: 'local-terminal-first' });
+    } finally {
+      await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    }
+  });
+
   it('accepts CEO brief through terminal-facing API and serves read-only status', async () => {
     const service = new ControlPlaneService({ planner: new HeuristicMissionPlanner(), missions: new InMemoryMissionStore() });
     const server = createControlPlaneServer(service);
