@@ -1,0 +1,106 @@
+import { ActorRefSchema, ApprovalIdSchema, CorrelationIdSchema, TaskIdSchema } from '../../contracts/dist/index.js';
+export const DEFAULT_CAPABILITY_POLICY = Object.freeze({
+    version: 1,
+    roles: Object.freeze({
+        engineer: Object.freeze(['repo.read', 'test.run']),
+        analyst: Object.freeze(['repo.read']),
+        reviewer: Object.freeze(['repo.read', 'test.run'])
+    }),
+    approvalRequired: Object.freeze([
+        'security.scan',
+        'security.write',
+        'secret.use',
+        'deploy.staging',
+        'deploy.production'
+    ])
+});
+const sameActor = (left, right) => JSON.stringify(left) === JSON.stringify(right);
+export class InMemoryCapabilityPolicy {
+    options;
+    constructor(options = {}) {
+        this.options = options;
+    }
+    async evaluate(request) {
+        const actor = ActorRefSchema.parse(request.actor);
+        const taskId = TaskIdSchema.parse(request.taskId);
+        const correlationId = CorrelationIdSchema.parse(request.correlationId);
+        const capability = request.capability.trim();
+        const resource = request.resource.trim();
+        if (!capability || !resource)
+            throw new Error('Capability and resource are required');
+        const policy = this.options.policy ?? DEFAULT_CAPABILITY_POLICY;
+        const role = actor.kind === 'AGENT' ? this.options.actorRoles?.get(actor.sessionId) : undefined;
+        const grants = role === undefined ? undefined : policy.roles[role];
+        if (actor.kind === 'AGENT' && (role === undefined || grants === undefined)) {
+            return {
+                allowed: false,
+                requiresApproval: false,
+                reason: 'Agent session has no mapped role'
+            };
+        }
+        if (actor.kind !== 'AGENT')
+            return { allowed: false, requiresApproval: false, reason: 'Only assigned agent sessions may use capabilities' };
+        const [session, task] = await Promise.all([
+            this.options.sessionRepository?.get(actor.sessionId), this.options.taskRepository?.get(taskId)
+        ]);
+        const resources = this.options.resourceScopes?.get(actor.sessionId);
+        if (!session || !task || session.state !== 'RUNNING' || !['RUNNING', 'REVIEW'].includes(task.state) ||
+            session.taskId !== taskId || session.workflowId !== task.workflowId ||
+            session.agentDefinitionId !== task.ownerAgentDefinitionId || session.traceId !== correlationId ||
+            !resource.startsWith(`project:${task.projectId}:`) || !resources?.includes(resource)) {
+            return { allowed: false, requiresApproval: false, reason: 'Session, task assignment, project or resource is outside the active scope' };
+        }
+        if (grants?.includes(capability)) {
+            return {
+                allowed: true,
+                requiresApproval: false,
+                reason: `Allowed by ${role} defaults (policy v${policy.version})`
+            };
+        }
+        if (!policy.approvalRequired.includes(capability)) {
+            return {
+                allowed: false,
+                requiresApproval: false,
+                reason: `Capability ${capability} is not granted by policy v${policy.version}`
+            };
+        }
+        const subjectId = `capability:${taskId}:${capability}:${resource}`;
+        const reason = `Use ${capability} on ${resource}`;
+        const idempotencyKey = subjectId;
+        if (this.options.approvalService === undefined) {
+            return { allowed: false, requiresApproval: true, reason: 'CEO approval is required' };
+        }
+        const requestInput = {
+            subjectType: 'CAPABILITY',
+            subjectId,
+            reason,
+            requestedBy: actor,
+            correlationId,
+            idempotencyKey
+        };
+        const requested = await this.options.approvalService.request(requestInput);
+        const approval = await this.options.approvalService.get(requested.approvalId);
+        const verified = approval.approvalId === requested.approvalId
+            && approval.subjectType === 'CAPABILITY'
+            && approval.subjectId === subjectId
+            && approval.reason === reason
+            && sameActor(approval.requestedBy, actor)
+            && approval.state === 'APPROVED'
+            && approval.decision === 'APPROVE';
+        if (verified) {
+            return {
+                allowed: true,
+                requiresApproval: false,
+                reason: 'Capability approved by CEO',
+                approvalId: ApprovalIdSchema.parse(approval.approvalId)
+            };
+        }
+        return {
+            allowed: false,
+            requiresApproval: true,
+            reason: approval.state === 'REJECTED' ? 'CEO rejected the capability request' : 'CEO approval is required',
+            approvalId: ApprovalIdSchema.parse(approval.approvalId)
+        };
+    }
+}
+//# sourceMappingURL=capability-policy.js.map

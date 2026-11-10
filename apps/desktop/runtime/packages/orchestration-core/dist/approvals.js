@@ -1,0 +1,282 @@
+import { ApprovalRecordSchema, CorrelationIdSchema, DomainEventSchema, EventIdSchema, TaskIdSchema, approvalId, eventId } from '../../contracts/dist/index.js';
+import { OptimisticConcurrencyError } from './repository.js';
+import { transitionTask } from './task-state-machine.js';
+export class ApprovalServiceError extends Error {
+    constructor(message) {
+        super(message);
+        this.name = 'ApprovalServiceError';
+    }
+}
+const clone = (value) => globalThis.structuredClone(value);
+const eventFor = (record, eventType, payload, actor, occurredAt, aggregateVersion, eventIdentifier) => DomainEventSchema.parse({
+    eventId: eventId(eventIdentifier),
+    aggregateType: 'APPROVAL',
+    aggregateId: record.approvalId,
+    aggregateVersion,
+    eventType,
+    actor,
+    correlationId: record.correlationId,
+    causationId: EventIdSchema.parse(record.causationId),
+    occurredAt,
+    payload
+});
+export class InMemoryApprovalStore {
+    records = new Map();
+    requestKeys = new Map();
+    decisionKeys = new Map();
+    events = [];
+    commands = [];
+    async commitRequest(record, idempotencyKey, fingerprint, event, command) {
+        const prior = this.requestKeys.get(idempotencyKey);
+        if (prior !== undefined) {
+            if (prior.fingerprint !== fingerprint) {
+                throw new ApprovalServiceError('Idempotency key was reused with different request data');
+            }
+            return clone(prior.record);
+        }
+        const parsed = ApprovalRecordSchema.parse(record);
+        this.records.set(parsed.approvalId, clone(parsed));
+        this.requestKeys.set(idempotencyKey, { fingerprint, record: clone(parsed) });
+        this.events.push(clone(event));
+        this.commands.push(clone(command));
+        return clone(parsed);
+    }
+    async get(id) {
+        const record = this.records.get(id);
+        return record === undefined ? null : clone(record);
+    }
+    async findByIdempotencyKey(key) {
+        const value = this.requestKeys.get(key);
+        return value === undefined ? null : { fingerprint: value.fingerprint, record: clone(value.record) };
+    }
+    async findDecision(key) {
+        const value = this.decisionKeys.get(key);
+        return value === undefined ? null : { fingerprint: value.fingerprint, record: clone(value.record) };
+    }
+    async commitDecision(record, expectedVersion, event, idempotencyKey, requestFingerprint) {
+        const prior = this.decisionKeys.get(idempotencyKey);
+        if (prior !== undefined) {
+            if (prior.fingerprint !== requestFingerprint) {
+                throw new ApprovalServiceError('Idempotency key was reused with different decision data');
+            }
+            return clone(prior.record);
+        }
+        const existing = this.records.get(record.approvalId);
+        if (existing === undefined)
+            throw new ApprovalServiceError('Approval was not found');
+        if (existing.version !== expectedVersion) {
+            throw new OptimisticConcurrencyError(record.approvalId, expectedVersion, existing.version);
+        }
+        if (existing.state !== 'PENDING' || record.version !== expectedVersion + 1) {
+            throw new ApprovalServiceError('Approval is no longer pending');
+        }
+        const parsed = ApprovalRecordSchema.parse(record);
+        this.records.set(parsed.approvalId, clone(parsed));
+        this.decisionKeys.set(idempotencyKey, { fingerprint: requestFingerprint, record: clone(parsed) });
+        this.events.push(clone(event));
+        return clone(parsed);
+    }
+    snapshot() {
+        return clone({
+            records: [...this.records.entries()],
+            requestKeys: [...this.requestKeys.entries()],
+            decisionKeys: [...this.decisionKeys.entries()],
+            events: this.events,
+            commands: this.commands
+        });
+    }
+    restore(snapshot) {
+        this.records.clear();
+        this.requestKeys.clear();
+        this.decisionKeys.clear();
+        for (const [id, record] of snapshot.records)
+            this.records.set(id, clone(record));
+        for (const [key, value] of snapshot.requestKeys)
+            this.requestKeys.set(key, clone(value));
+        for (const [key, value] of snapshot.decisionKeys)
+            this.decisionKeys.set(key, clone(value));
+        this.events.splice(0, this.events.length, ...clone(snapshot.events));
+        this.commands.splice(0, this.commands.length, ...clone(snapshot.commands));
+    }
+}
+export class ApprovalServiceImpl {
+    options;
+    now;
+    constructor(options) {
+        this.options = options;
+        this.now = options.now ?? (() => new Date());
+    }
+    async request(input) {
+        const normalized = {
+            ...input,
+            subjectId: input.subjectId.trim(),
+            reason: input.reason.trim(),
+            idempotencyKey: input.idempotencyKey.trim(),
+            correlationId: CorrelationIdSchema.parse(input.correlationId)
+        };
+        if (!normalized.subjectId || !normalized.reason || !normalized.idempotencyKey) {
+            throw new ApprovalServiceError('Approval request fields cannot be empty');
+        }
+        const fingerprint = JSON.stringify({
+            subjectType: normalized.subjectType,
+            subjectId: normalized.subjectId,
+            reason: normalized.reason,
+            requestedBy: normalized.requestedBy,
+            correlationId: normalized.correlationId
+        });
+        const prior = await this.options.approvals.findByIdempotencyKey(normalized.idempotencyKey);
+        if (prior !== null) {
+            if (prior.fingerprint !== fingerprint) {
+                throw new ApprovalServiceError('Idempotency key was reused with different request data');
+            }
+            return prior.record;
+        }
+        const now = this.now();
+        const id = this.options.newApprovalId?.(normalized)
+            ?? approvalId(`approval:${normalized.subjectType}:${normalized.subjectId}:${normalized.idempotencyKey}`);
+        const causationId = eventId(`approval:${id}:request`);
+        const record = ApprovalRecordSchema.parse({
+            approvalId: id,
+            subjectType: normalized.subjectType,
+            subjectId: normalized.subjectId,
+            reason: normalized.reason,
+            requestedBy: normalized.requestedBy,
+            correlationId: normalized.correlationId,
+            causationId,
+            version: 0,
+            createdAt: now,
+            updatedAt: now,
+            state: 'PENDING',
+            decision: null,
+            decisionReason: null,
+            decidedBy: null,
+            decidedAt: null
+        });
+        const event = eventFor(record, 'APPROVAL_REQUESTED', {
+            approvalId: id,
+            subjectType: record.subjectType,
+            subjectId: record.subjectId,
+            reason: record.reason
+        }, record.requestedBy, now, 0, `approval:${id}:request`);
+        const command = {
+            commandId: `request-approval:${id}`,
+            type: 'REQUEST_APPROVAL',
+            payload: {
+                subjectType: record.subjectType,
+                subjectId: record.subjectId,
+                reason: record.reason
+            },
+            actor: record.requestedBy,
+            issuedAt: now,
+            availableAt: now,
+            correlationId: record.correlationId,
+            causationId: event.eventId
+        };
+        const requestInput = {
+            approval: record,
+            requestEvent: event,
+            command,
+            idempotencyKey: normalized.idempotencyKey,
+            requestFingerprint: fingerprint
+        };
+        return this.options.transactionalPersistence.saveApprovalRequest(requestInput);
+    }
+    async decide(input) {
+        if (input.actor.kind !== 'CEO') {
+            throw new ApprovalServiceError('Only the CEO may decide approvals');
+        }
+        const idempotencyKey = input.idempotencyKey.trim();
+        const decisionReason = input.reason.trim();
+        if (!idempotencyKey || !decisionReason) {
+            throw new ApprovalServiceError('Decision reason and idempotency key are required');
+        }
+        const requestFingerprint = JSON.stringify({
+            approvalId: input.approvalId,
+            decision: input.decision,
+            actor: input.actor,
+            decisionReason
+        });
+        const replay = await this.options.approvals.findDecision(idempotencyKey);
+        if (replay !== null) {
+            if (replay.fingerprint !== requestFingerprint) {
+                throw new ApprovalServiceError('Idempotency key was reused with different decision data');
+            }
+            return replay.record;
+        }
+        const current = await this.options.approvals.get(input.approvalId);
+        if (current === null)
+            throw new ApprovalServiceError('Approval was not found');
+        if (current.version !== input.expectedVersion) {
+            throw new OptimisticConcurrencyError(current.approvalId, input.expectedVersion, current.version);
+        }
+        if (current.state !== 'PENDING')
+            throw new ApprovalServiceError('Approval is no longer pending');
+        const now = this.now();
+        const approved = input.decision === 'APPROVE';
+        const next = ApprovalRecordSchema.parse({
+            ...current,
+            version: current.version + 1,
+            updatedAt: now,
+            state: approved ? 'APPROVED' : 'REJECTED',
+            decision: input.decision,
+            decisionReason,
+            decidedBy: input.actor,
+            decidedAt: now,
+            reason: current.reason
+        });
+        const approvalEvent = eventFor(next, approved ? 'APPROVAL_APPROVED' : 'APPROVAL_REJECTED', approved
+            ? { approvalId: next.approvalId, decisionReason, decidedAt: now }
+            : { approvalId: next.approvalId, reason: decisionReason, decisionReason }, input.actor, now, current.version + 1, `approval:${next.approvalId}:v${current.version + 1}`);
+        let task = null;
+        let taskEvent;
+        const commands = [];
+        if (current.subjectType === 'DEPLOYMENT') {
+            task = await this.options.taskRepository.get(TaskIdSchema.parse(current.subjectId));
+            if (task === null || task.state !== 'WAITING_FOR_APPROVAL' || task.isDeployment !== true) {
+                throw new ApprovalServiceError('Deployment task is not waiting for approval');
+            }
+            const transition = transitionTask(task, approved
+                ? { type: 'DEPLOYMENT_APPROVED', approvalId: next.approvalId, approvalRecord: next }
+                : { type: 'DEPLOYMENT_REJECTED', approvalId: next.approvalId, reason: decisionReason, approvalRecord: next }, { actor: input.actor, now, evidenceIds: [], isDeployment: true });
+            task = transition.task;
+            taskEvent = transition.event;
+            if (approved) {
+                commands.push({
+                    commandId: `deploy:${task.id}:${next.approvalId}`,
+                    type: 'DEPLOY',
+                    payload: { taskId: task.id, approvalId: next.approvalId,
+                        attemptId: task.deploymentAttemptId },
+                    actor: input.actor,
+                    issuedAt: now,
+                    availableAt: now,
+                    correlationId: next.correlationId,
+                    causationId: taskEvent.eventId
+                });
+            }
+        }
+        const atomicInput = {
+            approval: next,
+            expectedApprovalVersion: current.version,
+            approvalEvent,
+            commands,
+            idempotencyKey,
+            requestFingerprint
+        };
+        if (task !== null) {
+            if (taskEvent === undefined)
+                throw new ApprovalServiceError('Deployment transition did not produce an event');
+            atomicInput.task = task;
+            atomicInput.expectedTaskVersion = task.version - 1;
+            atomicInput.taskEvent = taskEvent;
+        }
+        await this.options.transactionalPersistence.saveApprovalDecisionAndTask(atomicInput);
+        return next;
+    }
+    async get(id) {
+        const record = await this.options.approvals.get(id);
+        if (record === null)
+            throw new ApprovalServiceError('Approval was not found');
+        return record;
+    }
+}
+//# sourceMappingURL=approvals.js.map

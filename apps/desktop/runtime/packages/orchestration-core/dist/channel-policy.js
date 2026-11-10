@@ -1,0 +1,66 @@
+import { ActorRefSchema, TaskIdSchema } from '../../contracts/dist/index.js';
+export class ChannelAuthorizationError extends Error {
+    constructor(message) {
+        super(message);
+        this.name = 'ChannelAuthorizationError';
+    }
+}
+const actorKey = (actor) => {
+    const parsed = ActorRefSchema.parse(actor);
+    return parsed.kind === 'AGENT' ? `AGENT:${parsed.sessionId}` : parsed.kind === 'CEO' ? 'CEO' : `SYSTEM:${parsed.name}`;
+};
+const scopeKey = (scope) => {
+    if (scope.kind === 'task')
+        return `task:${TaskIdSchema.parse(scope.taskId)}`;
+    if (scope.kind === 'project' && scope.projectId.trim().length > 0)
+        return `project:${scope.projectId.trim()}`;
+    throw new ChannelAuthorizationError('A valid scoped channel is required');
+};
+export class InMemoryChannelAuthorization {
+    tasks = new Map();
+    projectAssignments;
+    cancelledSessions;
+    constructor(options) {
+        this.tasks = new Map(options.tasks.map((entry) => [TaskIdSchema.parse(entry.taskId), entry]));
+        this.projectAssignments = options.projectAssignments;
+        this.cancelledSessions = new Set(options.cancelledSessions);
+    }
+    async authorizeRead(actor, scope) {
+        this.assertActive(actor);
+        scopeKey(scope);
+        if (scope.kind === 'project') {
+            if (actor.kind !== 'AGENT' || !this.projectAssignments.some((assignment) => assignment.projectId === scope.projectId.trim() && actorKey(assignment.actor) === actorKey(actor))) {
+                throw new ChannelAuthorizationError('Actor is not assigned to this project channel');
+            }
+            return;
+        }
+        this.assertTaskParticipant(actor, scope.taskId);
+    }
+    async authorizeWrite(actor, scope) {
+        this.assertActive(actor);
+        scopeKey(scope);
+        if (scope.kind === 'task') {
+            this.assertTaskParticipant(actor, scope.taskId);
+            return;
+        }
+        if (actor.kind !== 'AGENT' || !this.projectAssignments.some((assignment) => assignment.projectId === scope.projectId.trim() && actorKey(assignment.actor) === actorKey(actor))) {
+            throw new ChannelAuthorizationError('Actor is not assigned to this project channel');
+        }
+    }
+    assertActive(actor) {
+        const parsed = ActorRefSchema.parse(actor);
+        if (parsed.kind === 'AGENT' && this.cancelledSessions.has(parsed.sessionId)) {
+            throw new ChannelAuthorizationError('Cancelled sessions cannot access communication channels');
+        }
+    }
+    assertTaskParticipant(actor, taskId) {
+        const task = this.tasks.get(TaskIdSchema.parse(taskId));
+        if (!task)
+            throw new ChannelAuthorizationError('Task channel does not exist');
+        const key = actorKey(actor);
+        if ([task.assignee, ...task.supervisors, ...task.invited].some((participant) => actorKey(participant) === key))
+            return;
+        throw new ChannelAuthorizationError('Actor is not authorized for this task channel');
+    }
+}
+//# sourceMappingURL=channel-policy.js.map

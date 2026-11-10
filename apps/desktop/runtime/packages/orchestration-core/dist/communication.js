@@ -1,0 +1,94 @@
+import { ActorRefSchema, CorrelationIdSchema, DomainEventSchema, EventIdSchema, TaskIdSchema } from '../../contracts/dist/index.js';
+import { ChannelAuthorizationError } from './channel-policy.js';
+export class InMemoryDomainEventPublisher {
+    events = new Map();
+    async publish(event) {
+        const parsed = DomainEventSchema.parse(event);
+        const prior = this.events.get(parsed.eventId);
+        if (prior) {
+            if (stableJson(prior) !== stableJson(parsed))
+                throw new Error(`Event ID ${parsed.eventId} was reused with different content`);
+            return;
+        }
+        this.events.set(parsed.eventId, structuredClone(parsed));
+    }
+    publishedEvents() {
+        return [...this.events.values()].map((event) => structuredClone(event));
+    }
+}
+const keyFor = (scope) => scope.kind === 'task'
+    ? `task:${TaskIdSchema.parse(scope.taskId)}`
+    : `project:${scope.projectId.trim()}`;
+const cloneMessage = (message) => ({ ...message, scope: { ...message.scope }, actor: { ...message.actor }, createdAt: new Date(message.createdAt) });
+const stableJson = (value) => JSON.stringify(value, (_key, item) => item instanceof Date ? item.toISOString() : item);
+const secretLike = (reference) => /(?:password|passwd|secret|api[_-]?key|access[_-]?token|private[_-]?key)\s*[:=]\s*\S+/i.test(reference);
+export class InMemoryMessageStore {
+    messages = [];
+    idempotency = new Map();
+    async append(message, idempotencyKey) {
+        const fingerprint = stableJson({ ...message, messageId: undefined, createdAt: undefined });
+        const prior = this.idempotency.get(idempotencyKey);
+        if (prior) {
+            if (prior.fingerprint !== fingerprint)
+                throw new Error('Message idempotency key was reused with different content');
+            return cloneMessage(prior.message);
+        }
+        const stored = cloneMessage(message);
+        this.messages.push(stored);
+        this.idempotency.set(idempotencyKey, { fingerprint, message: stored });
+        return cloneMessage(stored);
+    }
+    async list(scope, after) {
+        const matching = this.messages.filter((message) => keyFor(message.scope) === keyFor(scope));
+        const start = after === undefined ? 0 : Math.max(0, matching.findIndex((message) => message.messageId === after) + 1);
+        return matching.slice(start).map(cloneMessage);
+    }
+}
+export class InMemoryCommunicationService {
+    store;
+    authorization;
+    eventPublisher;
+    options;
+    constructor(store, authorization, eventPublisher, options) {
+        this.store = store;
+        this.authorization = authorization;
+        this.eventPublisher = eventPublisher;
+        this.options = options;
+    }
+    async sendMessage(input) {
+        await this.authorization.authorizeWrite(input.actor, input.scope);
+        const actor = ActorRefSchema.parse(input.actor);
+        const scope = input.scope.kind === 'task'
+            ? { kind: 'task', taskId: TaskIdSchema.parse(input.scope.taskId) }
+            : { kind: 'project', projectId: input.scope.projectId.trim() };
+        const reference = input.contentReference.trim();
+        if (reference.length === 0 || secretLike(reference))
+            throw new ChannelAuthorizationError('Message content must be a safe artifact or content reference');
+        const messageType = input.messageType;
+        if (!['CHAT', 'PROGRESS', 'HANDOFF', 'BLOCKER'].includes(messageType))
+            throw new Error('Unknown message type');
+        const correlation = CorrelationIdSchema.parse(input.correlationId);
+        const causation = EventIdSchema.parse(input.causationId);
+        const idempotencyKey = `${keyFor(scope)}:${actor.kind === 'AGENT' ? actor.sessionId : actor.kind}:${causation}:${messageType}`;
+        const message = {
+            messageId: this.options.newMessageId(), actor, scope, messageType, contentReference: reference,
+            correlationId: correlation, causationId: causation, createdAt: (this.options.now ?? (() => new Date()))()
+        };
+        return this.store.append(message, idempotencyKey);
+    }
+    async publishEvent(event) {
+        const parsed = DomainEventSchema.parse(event);
+        const scope = parsed.aggregateType === 'TASK'
+            ? { kind: 'task', taskId: TaskIdSchema.parse(parsed.aggregateId) }
+            : this.options.eventScopeResolver?.(parsed);
+        if (!scope)
+            throw new Error(`An event scope resolver is required for ${parsed.aggregateType} events`);
+        await this.authorization.authorizeWrite(parsed.actor, scope);
+        await this.eventPublisher.publish(parsed);
+    }
+    async listMessages(scope, after) {
+        await this.authorization.authorizeRead(this.options.reader(), scope);
+        return this.store.list(scope, after);
+    }
+}
+//# sourceMappingURL=communication.js.map

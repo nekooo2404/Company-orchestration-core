@@ -10,6 +10,8 @@ coverage/
 !.env.example
 postgres-data/
 apps/desktop/runtime/
+!apps/desktop/runtime/
+!apps/desktop/runtime/**
 apps/desktop/release/
 .local/
 apps/mission-grid/out/
