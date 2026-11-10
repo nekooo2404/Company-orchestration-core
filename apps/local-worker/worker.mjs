@@ -50,7 +50,7 @@ const dockerRunner = new DockerToolRunner(workspace, workspaceDescriptors, {
 });
 const gateway = new OpenAICompatibleGateway({
   endpoints: [{ id: modelEndpointId, provider: configuredEndpoint?.provider || env.MODEL_PROVIDER?.trim() || 'openai-compatible', baseUrl: modelBaseUrl, model: modelName, credentialRef: modelCredentialRef, timeoutMs: configuredEndpoint?.timeoutMs || 120_000, maxRetries: configuredEndpoint?.maxRetries ?? 2, circuitFailureThreshold: configuredEndpoint?.circuitFailureThreshold || 3, circuitResetMs: configuredEndpoint?.circuitResetMs || 30_000, inputCostPerMillionTokens: configuredEndpoint?.inputCostPerMillionTokens, outputCostPerMillionTokens: configuredEndpoint?.outputCostPerMillionTokens, allowInsecureLocalHttp: configuredEndpoint?.allowInsecureLocalHttp ?? env.MODEL_ALLOW_INSECURE_LOCAL_HTTP === 'true' }],
-  secrets: { async resolve(reference) { if (!reference.startsWith('env:')) throw new Error('Local worker only supports env: credential references'); return required(reference.slice(4)); } },
+  secrets: { async resolve(reference) { if (configuredEndpoint?.apiKey) return configuredEndpoint.apiKey; if (!reference.startsWith('env:')) throw new Error('Local worker only supports env: credential references'); return required(reference.slice(4)); } },
   usage: costs,
   audit: { async record(record) { stdout.write(`[gateway] ${JSON.stringify(record)}\n`); } }
 });

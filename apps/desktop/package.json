@@ -1,0 +1,51 @@
+{
+  "name": "@aicompany/desktop",
+  "version": "0.1.1",
+  "private": true,
+  "packageManager": "npm@10.9.2",
+  "main": "main.mjs",
+  "scripts": {
+    "start": "electron .",
+    "dist": "electron-builder --win"
+  },
+  "devDependencies": {
+    "electron": "^45.2.3",
+    "electron-builder": "^26.18.0"
+  },
+  "build": {
+    "appId": "com.aicompany.desktop",
+    "productName": "AIcompany",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "main.mjs",
+      "preload.mjs",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "runtime",
+        "to": "runtime"
+      }
+    ],
+    "npmRebuild": false,
+    "nodeGypRebuild": false,
+    "buildDependenciesFromSource": false,
+    "disableDefaultIgnoredFiles": true,
+    "win": {
+      "target": [
+        "nsis",
+        "portable"
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true
+    }
+  },
+  "dependencies": {
+    "node-pty": "1.1.0"
+  }
+}

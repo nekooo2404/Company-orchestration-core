@@ -9,6 +9,13 @@ interface OpenAIResponse {
   usage?: { prompt_tokens?: number; completion_tokens?: number };
 }
 
+interface AnthropicResponse {
+  model?: string;
+  stop_reason?: string | null;
+  content?: Array<{ type?: string; text?: string }>;
+  usage?: { input_tokens?: number; output_tokens?: number };
+}
+
 const sleepDefault = (milliseconds: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, milliseconds));
 const retryable = (status: number): boolean => status === 408 || status === 409 || status === 429 || status >= 500;
 const safeHeader = (key: string): boolean => !/authorization|api[-_]?key|token|secret/i.test(key);
@@ -18,7 +25,8 @@ const endpointUrl = (config: ModelEndpointConfig): string => {
   const localHttp = parsed.protocol === 'http:' && (parsed.hostname === 'localhost' || parsed.hostname === '127.0.0.1');
   if (parsed.protocol !== 'https:' && !(localHttp && config.allowInsecureLocalHttp)) throw new Error('Model endpoint must use HTTPS');
   if (parsed.username || parsed.password) throw new Error('Model endpoint URL must not contain credentials');
-  return new URL('chat/completions', `${parsed.toString().replace(/\/$/, '')}/`).toString();
+  const baseUrl = parsed.toString().replace(/\/$/, '') + '/';
+  return new URL(config.provider.toLowerCase() === 'anthropic' ? 'messages' : 'chat/completions', baseUrl).toString();
 };
 const healthUrl = (config: ModelEndpointConfig): string => new URL('models', `${new URL(config.baseUrl).toString().replace(/\/$/, '')}/`).toString();
 
@@ -61,10 +69,17 @@ export class OpenAICompatibleGateway implements ModelGateway {
         try {
           let response: Response;
           try {
+            const anthropic = endpoint.provider.toLowerCase() === 'anthropic';
+            const messages = input.messages.filter(({ role }) => role !== 'system').map(({ role, content }) => ({ role: role === 'tool' ? 'user' : role, content }));
+            const system = input.messages.filter(({ role }) => role === 'system').map(({ content }) => content).join('\n') || undefined;
             response = await this.fetcher(endpointUrl(endpoint), {
               method: 'POST', signal: controller.signal,
-              headers: { 'content-type': 'application/json', authorization: `Bearer ${secret}`, ...this.safeHeaders(endpoint.headers) },
-              body: JSON.stringify({ model: endpoint.model, messages: input.messages, ...(input.temperature === undefined ? {} : { temperature: input.temperature }), ...(input.maxTokens === undefined ? {} : { max_tokens: input.maxTokens }) })
+              headers: anthropic
+                ? { 'content-type': 'application/json', 'x-api-key': secret, 'anthropic-version': '2023-06-01', ...this.safeHeaders(endpoint.headers) }
+                : { 'content-type': 'application/json', authorization: 'Bearer ' + secret, ...this.safeHeaders(endpoint.headers) },
+              body: JSON.stringify(anthropic
+                ? { model: endpoint.model, messages, max_tokens: input.maxTokens ?? 4096, ...(system === undefined ? {} : { system }), ...(input.temperature === undefined ? {} : { temperature: input.temperature }) }
+                : { model: endpoint.model, messages: input.messages, ...(input.temperature === undefined ? {} : { temperature: input.temperature }), ...(input.maxTokens === undefined ? {} : { max_tokens: input.maxTokens }) })
             });
           } catch (error) {
             if (attempt < endpoint.maxRetries) { await this.sleep(2 ** attempt * 25); continue; }
@@ -77,13 +92,14 @@ export class OpenAICompatibleGateway implements ModelGateway {
             circuit.failure();
             throw new Error(`Model gateway request failed with HTTP ${response.status}: ${body.slice(0, 300)}`);
           }
-          const payload = await response.json() as OpenAIResponse;
-          const content = payload.choices?.[0]?.message?.content;
+          const payload = await response.json() as OpenAIResponse & AnthropicResponse;
+          const anthropic = endpoint.provider.toLowerCase() === 'anthropic';
+          const content = anthropic ? payload.content?.filter((block) => block.type === 'text').map((block) => block.text ?? '').join('') : payload.choices?.[0]?.message?.content;
           if (typeof content !== 'string') throw new Error('Model response did not contain message content');
-          const inputTokens = payload.usage?.prompt_tokens ?? 0;
-          const outputTokens = payload.usage?.completion_tokens ?? 0;
+          const inputTokens = anthropic ? payload.usage?.input_tokens ?? 0 : payload.usage?.prompt_tokens ?? 0;
+          const outputTokens = anthropic ? payload.usage?.output_tokens ?? 0 : payload.usage?.completion_tokens ?? 0;
           circuit.success();
-          const result: ModelResponse = { requestId, endpointId: endpoint.id, provider: endpoint.provider, model: payload.model ?? endpoint.model, content, finishReason: payload.choices?.[0]?.finish_reason ?? null, inputTokens, outputTokens, createdAt: new Date() };
+          const result: ModelResponse = { requestId, endpointId: endpoint.id, provider: endpoint.provider, model: payload.model ?? endpoint.model, content, finishReason: anthropic ? payload.stop_reason ?? null : payload.choices?.[0]?.finish_reason ?? null, inputTokens, outputTokens, createdAt: new Date() };
           await this.audit({ requestId, endpointId: endpoint.id, provider: endpoint.provider, model: result.model, status: 'SUCCESS', httpStatus: response.status, attempts, durationMs: Date.now() - startedAt });
           await this.recordUsage(input, endpoint, result);
           return result;
@@ -103,7 +119,10 @@ export class OpenAICompatibleGateway implements ModelGateway {
     const startedAt = Date.now();
     try {
       const secret = await this.options.secrets.resolve(endpoint.credentialRef);
-      const response = await this.fetcher(healthUrl(endpoint), { headers: { authorization: `Bearer ${secret}`, ...this.safeHeaders(endpoint.headers) } });
+      const headers = endpoint.provider.toLowerCase() === 'anthropic'
+        ? { 'x-api-key': secret, 'anthropic-version': '2023-06-01', ...this.safeHeaders(endpoint.headers) }
+        : { authorization: 'Bearer ' + secret, ...this.safeHeaders(endpoint.headers) };
+      const response = await this.fetcher(healthUrl(endpoint), { headers });
       return { endpointId, healthy: response.ok, latencyMs: Date.now() - startedAt, status: response.status, ...(response.ok ? {} : { reason: `HTTP ${response.status}` }) };
     } catch (error) {
       return { endpointId, healthy: false, latencyMs: Date.now() - startedAt, reason: error instanceof Error ? error.message : 'Unknown error' };

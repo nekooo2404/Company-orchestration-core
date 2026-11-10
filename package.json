@@ -1,10 +1,13 @@
 {
   "name": "ai-company",
   "private": true,
+  "packageManager": "pnpm@12.18.0",
   "scripts": {
     "build": "tsc -b",
     "control-plane:dev": "corepack pnpm build && node apps/control-plane-server/server.mjs",
     "worker:dev": "corepack pnpm build && node apps/local-worker/worker.mjs",
+    "desktop:prepare": "node scripts/prepare-desktop.mjs",
+    "desktop:dist": "corepack pnpm build && corepack pnpm --filter @aicompany/mission-grid build && corepack pnpm desktop:prepare && corepack pnpm --filter @aicompany/desktop exec electron-builder --win",
     "ceo": "node apps/ceo-cli/cli.mjs",
     "test": "vitest run",
     "test:watch": "vitest",

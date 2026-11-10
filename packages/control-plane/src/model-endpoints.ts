@@ -1,10 +1,11 @@
 import type { ModelEndpointConfig } from '@aicompany/model-gateway';
 
-export type ModelEndpointInput = Omit<ModelEndpointConfig, 'id'> & { id: string };
+export type ModelEndpointInput = Omit<ModelEndpointConfig, 'id'> & { id: string; apiKey?: string };
+export type StoredModelEndpoint = ModelEndpointConfig & { apiKey?: string };
 
 export interface ModelEndpointStore {
   list(): Promise<ModelEndpointConfig[]>;
-  get(id: string): Promise<ModelEndpointConfig | null>;
+  get(id: string): Promise<StoredModelEndpoint | null>;
   save(config: ModelEndpointInput): Promise<void>;
 }
 
@@ -30,13 +31,18 @@ export const validateModelEndpoint = (input: ModelEndpointInput): ModelEndpointC
 };
 
 export class InMemoryModelEndpointStore implements ModelEndpointStore {
-  private readonly endpoints = new Map<string, ModelEndpointConfig>();
+  private readonly endpoints = new Map<string, StoredModelEndpoint>();
 
   public constructor(initial: readonly ModelEndpointConfig[] = []) {
     for (const config of initial) this.endpoints.set(config.id, validateModelEndpoint(config));
   }
 
   public async list(): Promise<ModelEndpointConfig[]> { return [...this.endpoints.values()].map(clone); }
-  public async get(id: string): Promise<ModelEndpointConfig | null> { const config = this.endpoints.get(id); return config ? clone(config) : null; }
-  public async save(input: ModelEndpointInput): Promise<void> { const config = validateModelEndpoint(input); this.endpoints.set(config.id, config); }
+  public async get(id: string): Promise<StoredModelEndpoint | null> { const config = this.endpoints.get(id); return config ? clone(config) : null; }
+  public async save(input: ModelEndpointInput): Promise<void> {
+    const config = validateModelEndpoint(input);
+    const prior = this.endpoints.get(config.id);
+    const apiKey = input.apiKey?.trim() || prior?.apiKey;
+    this.endpoints.set(config.id, apiKey ? { ...config, apiKey } : config);
+  }
 }

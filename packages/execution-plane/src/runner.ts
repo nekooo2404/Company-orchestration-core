@@ -5,7 +5,7 @@ import { FilesystemWorkspace } from './workspace.js';
 const DEFAULT_ALLOWED_COMMANDS = new Set([
   'bash', 'cargo', 'dotnet', 'git', 'gradle', 'java', 'mvn', 'node', 'npm', 'pnpm', 'python', 'python3', 'pwsh'
 ]);
-const SAFE_ENV_KEYS = new Set(['PATH', 'HOME', 'USERPROFILE', 'TEMP', 'TMP', 'LANG', 'LC_ALL', 'CI', 'NODE_ENV']);
+const SAFE_ENV_KEYS = new Set(['PATH', 'HOME', 'USERPROFILE', 'TEMP', 'TMP', 'LANG', 'LC_ALL', 'CI', 'NODE_ENV', 'ELECTRON_RUN_AS_NODE']);
 
 const appendBounded = (chunks: string[], chunk: Buffer | string, limit: number): void => {
   const current = Buffer.byteLength(chunks.join(''));

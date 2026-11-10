@@ -27,6 +27,7 @@ CREATE TABLE IF NOT EXISTS model_endpoints (
   base_url text NOT NULL,
   model text NOT NULL,
   credential_ref text NOT NULL,
+  api_key text,
   headers jsonb,
   timeout_ms integer NOT NULL,
   max_retries integer NOT NULL,
@@ -37,6 +38,8 @@ CREATE TABLE IF NOT EXISTS model_endpoints (
   allow_insecure_local_http boolean NOT NULL DEFAULT false,
   updated_at timestamptz NOT NULL
 );
+
+ALTER TABLE model_endpoints ADD COLUMN IF NOT EXISTS api_key text;
 
 CREATE TABLE IF NOT EXISTS tasks (
   task_id text PRIMARY KEY,
